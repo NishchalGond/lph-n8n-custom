@@ -220,6 +220,14 @@ def looks_like_header(row):
     # regardless of how many other cells look label-like.
     if any(_EMAIL_LOOSE_RE.search(c) for c in non_empty):
         return False
+    # Hard veto: a row containing a bare numeric value (any length -- "53",
+    # "200", "493996") is never a real header either. Real header labels are
+    # words/phrases; a naked number in a header row means this is actually a
+    # data row (an ID, unit count, code, etc.) that slipped past the other
+    # checks. This is what let single names like "Amjad" paired with a short
+    # code like "200" get misread as a header on some sheets.
+    if any(re.sub(r"[\s]", "", c).isdigit() for c in non_empty):
+        return False
     if any(normalize_header(c) in _KNOWN_HEADER_NORMS for c in non_empty):
         return True
     label_like = sum(1 for c in non_empty if not _looks_like_data_value(c))
