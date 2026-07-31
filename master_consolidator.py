@@ -1,4 +1,3 @@
-
 """
 LPH Master Database Consolidation Engine
 =========================================
@@ -53,32 +52,63 @@ import openpyxl
 # ============================================================================
 HEADER_SYNONYMS = {
     "Name": ["name", "owner name", "owner", "client name", "owners name",
-             "customer name", "name of owner", "client"],
+             "customer name", "name of owner", "client", "full name",
+             "first name", "client full name", "primary applicant name",
+             "nameen", "joint acct name", "account name"],
     "Unit Number": ["unit", "unit no", "unit number", "villa number", "villa no",
                      "property number", "property no", "land number", "land no",
-                     "plot number", "plot no", "no of unit", "no of units", "unit id"],
+                     "plot number", "plot no", "no of unit", "no of units", "unit id",
+                     "unitnumber", "flat number", "flat", "unit name"],
     "Mobile Number": ["phone", "mobile", "number", "contact number", "phone number",
                         "contact no", "contact", "mobile no", "mobile number",
-                        "tel", "telephone", "phone no", "primary phone"],
+                        "tel", "telephone", "phone no", "primary phone",
+                        "phone mobile", "mobile 1", "primary mobile number",
+                        "poa mobile no."],
     "Secondary Mobile Number": ["secondary mobile", "secondary phone", "alternate number",
                                   "alt number", "alternative number", "second contact",
-                                  "other number"],
-    "Email Address": ["email", "e-mail", "email address", "e mail"],
-    "Community": ["community", "community name"],
+                                  "other number", "mobile 2", "mobile no.3",
+                                  "mobile phone3", "mobile 3", "poa phone no."],
+    "Telephone Number": ["telephone number", "telephone residence", "telephone office",
+                          "phone 1", "phone 2", "phone no.3", "general"],
+    "Email Address": ["email", "e-mail", "email address", "e mail", "email add"],
+    "Community": ["community", "community name", "master location", "sub community"],
     "Developer": ["developer", "project developer"],
-    "Building / Tower": ["building", "tower"],
-    "Project": ["project", "project name"],
+    "Building / Tower": ["building", "tower", "building name", "building 1",
+                          "buildingname 2", "buildingnameen", "tower name",
+                          "bldg.", "bldg. no."],
+    "Project": ["project", "project name", "master project", "emaar project",
+                "master project land", "project lnd", "sub project"],
     "Phase": ["phase", "project phase"],
-    "Bedrooms": ["bhk", "no bhk", "bedrooms", "no of bedrooms", "bed"],
+    "Bedrooms": ["bhk", "no bhk", "bedrooms", "no of bedrooms", "bed", "beds",
+                 "rooms", "rooms description", "flat typology"],
     "Serial No": ["serial no", "serial number", "sno", "sr no"],
     "Nationality": ["nationality", "nation"],
+    "Emirates ID Number": ["idnumber", "uaeidnumber", "emirates id number"],
+    "Passport Number": ["passport"],
+    "Date of Birth": ["birthdate", "dob"],
+    "Gender": ["gender"],
 }
+
+# NOTE ON THIS LIST: this is a starting expansion based on one real production
+# dataset, not an exhaustive mapping. Columns that still show up as sparse,
+# near-duplicate fields after a run (e.g. two columns that clearly mean the
+# same real-world thing) should be added here as new synonyms -- that is the
+# intended, ongoing maintenance loop for this file. Deliberately NOT merged in
+# this pass: fields that look similar but carry different units or meanings
+# (e.g. "Built-up area sqm" vs "Built-up area sqft" vs "Plot area sqft" --
+# merging these would silently mix square-meter and square-foot values in one
+# column) or different real-world concepts (e.g. "Residence Country" is not
+# the same fact as "Nationality"). Those are left as separate columns on
+# purpose rather than guessed at.
 
 SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".csv"}
 
 # Meta/enrichment columns are always appended at the very end, after every
 # real data column, so real data never gets pushed around by these.
-META_COLUMNS = ["_source_file", "_source_sheet", "_source_row", "_ingested_at"]
+# "Record ID" is the one exception -- write_master pins it as the FIRST
+# column, since it's the stable key meant for merging/updating against in
+# future runs, not incidental bookkeeping like the others.
+META_COLUMNS = ["Record ID", "_source_file", "_source_sheet", "_source_row", "_ingested_at"]
 ENRICHMENT_COLUMNS = ["Mobile Number (Normalized)", "Email Valid", "Possible Duplicate Of"]
 
 
@@ -148,14 +178,23 @@ for _canon, _syns in HEADER_SYNONYMS.items():
         _KNOWN_HEADER_NORMS.add(normalize_header(_s))
 
 
+_EMAIL_LOOSE_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
 def _looks_like_data_value(s):
     """True if a cell's shape screams 'this is a data value', e.g. a phone
-    number, a unit/serial code (letters+digits+hyphens), or a full personal
-    name (two-plus alphabetic words) -- as opposed to a short header label."""
+    number, an email address, a short numeric code/ID, a unit/serial code
+    (letters+digits+hyphens), or a full personal name (two-plus alphabetic
+    words) -- as opposed to a short header label."""
     s = s.strip()
+    if _EMAIL_LOOSE_RE.search(s):
+        return True  # contains an email address -- never a header
     digits_only = re.sub(r"[^\d]", "", s)
-    if digits_only and len(digits_only) >= 7 and len(digits_only) >= len(s) - 2:
-        return True  # phone-number-shaped
+    if digits_only and len(digits_only) >= 4 and len(digits_only) >= len(s) - 3:
+        return True  # phone-number- or numeric-code-shaped (e.g. "53", "493996",
+                      # "971 569346555") -- lowered from a 7-digit floor because
+                      # short numeric IDs/codes were previously slipping through
+                      # and getting miscounted as header-like labels
     if re.match(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+){2,}$", s):
         return True  # code-shaped, e.g. SC-YN7-CON-CR48-101
     words = s.split()
@@ -168,11 +207,18 @@ def looks_like_header(row):
     """A real header row either contains a cell matching known field
     vocabulary (Name, Mobile Number, Email, etc. and their synonyms -- the
     strong signal), or, failing that, is mostly short labels that don't look
-    like phone numbers, codes, or personal names (the fallback signal).
-    Guards against sheets whose first row is already data, which would
-    otherwise be misread as a header and silently dropped."""
+    like phone numbers, codes, emails, or personal names (the fallback
+    signal). Guards against sheets whose first row is already data, which
+    would otherwise be misread as a header and silently dropped -- and,
+    just as importantly, guards against an actual DATA row (someone's real
+    name/email/phone number) being misread as a header, which would turn
+    private data into permanent column names across the whole database."""
     non_empty = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
     if len(non_empty) < 2:
+        return False
+    # Hard veto: a row containing an email address is never a real header,
+    # regardless of how many other cells look label-like.
+    if any(_EMAIL_LOOSE_RE.search(c) for c in non_empty):
         return False
     if any(normalize_header(c) in _KNOWN_HEADER_NORMS for c in non_empty):
         return True
@@ -204,11 +250,14 @@ def infer_generic_headers(sample_rows, width):
         digit_like = sum(1 for v in vals
                           if str(v).replace(" ", "").replace("+", "").isdigit()
                           and len(str(v).replace(" ", "")) >= 7)
+        email_like = sum(1 for v in vals if _EMAIL_LOOSE_RE.search(str(v)))
         code_like = sum(1 for v in vals if re.match(r"^[A-Z0-9\-]{4,}$", str(v).strip()))
         alpha_multiword = sum(1 for v in vals
                                if isinstance(v, str) and len(v.split()) >= 2
                                and v.replace(" ", "").isalpha())
-        if digit_like / n > 0.6:
+        if email_like / n > 0.6:
+            headers[col] = "Email Address"
+        elif digit_like / n > 0.6:
             headers[col] = "Mobile Number"
         elif alpha_multiword / n > 0.6:
             headers[col] = "Name"
@@ -454,7 +503,8 @@ def load_existing_master(path):
 
 
 def write_master(path, columns, records):
-    ordered_cols = columns + [c for c in META_COLUMNS + ENRICHMENT_COLUMNS if c not in columns]
+    rest_meta = [c for c in META_COLUMNS + ENRICHMENT_COLUMNS if c not in columns and c != "Record ID"]
+    ordered_cols = ["Record ID"] + columns + rest_meta
     wb = openpyxl.Workbook(write_only=True)
     ws = wb.create_sheet("Master")
     ws.append(ordered_cols)
@@ -494,11 +544,28 @@ def consolidate(source_dir, master_path, registry_path, log_path):
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
 
+    # Record ID is a stable, append-only synthetic primary key -- existing
+    # rows KEEP whatever ID they were already assigned (never renumbered);
+    # new rows continue the sequence from the current highest ID. This is
+    # what makes it safe to use "Record ID" to key against this Master
+    # Database from other systems/future imports across repeated runs.
+    next_id = 1
+    for r in existing_records:
+        try:
+            rid = int(r.get("Record ID") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        if rid >= next_id:
+            next_id = rid + 1
+
     files = sorted(p for p in source_dir.rglob("*")
                     if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS)
 
     for path in files:
         recs = read_workbook(path, registry, log_entries, processed_registry)
+        for rec in recs:
+            rec["Record ID"] = next_id
+            next_id += 1
         all_new_records.extend(recs)
 
     combined = existing_records + all_new_records
