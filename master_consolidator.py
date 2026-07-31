@@ -272,6 +272,9 @@ def find_header_row(rows, max_scan=10):
     return None
 
 
+_BEDROOM_LIKE_RE = re.compile(r"\b(bedroom|studio|\bbr\b|bhk)\b", re.IGNORECASE)
+
+
 def infer_generic_headers(sample_rows, width):
     """For headerless sheets: lightweight type inference per column so data
     still lands in a sensible bucket instead of being lost under 'Column N'."""
@@ -287,7 +290,20 @@ def infer_generic_headers(sample_rows, width):
                           if str(v).replace(" ", "").replace("+", "").isdigit()
                           and len(str(v).replace(" ", "")) >= 7)
         email_like = sum(1 for v in vals if _EMAIL_LOOSE_RE.search(str(v)))
-        code_like = sum(1 for v in vals if re.match(r"^[A-Z0-9\-]{4,}$", str(v).strip()))
+        # Codes like "PRK1/2E416F" -- allow "/" alongside "-" since real unit
+        # codes in this data use both separators. Spaces are stripped first
+        # because a handful of source rows have stray spaces mid-code
+        # (e.g. "PRKI /SD119/2F558F").
+        code_like = sum(1 for v in vals
+                          if re.match(r"^[A-Za-z0-9/\-]{4,}$", str(v).strip().replace(" ", ""))
+                          and any(ch.isdigit() for ch in str(v)))
+        # "Four Bedroom", "Studio", "2 BHK" etc. are unit-type descriptions,
+        # not personal names -- checked BEFORE the name check below, since a
+        # phrase like "Four Bedroom" is two alphabetic words and would
+        # otherwise be indistinguishable from a real name like "Ahmed Ali"
+        # by word-count/shape alone. This was misclassifying an entire
+        # headerless sheet's bedroom-count column as "Name".
+        bedroom_like = sum(1 for v in vals if isinstance(v, str) and _BEDROOM_LIKE_RE.search(v))
         alpha_multiword = sum(1 for v in vals
                                if isinstance(v, str) and len(v.split()) >= 2
                                and v.replace(" ", "").isalpha())
@@ -295,6 +311,8 @@ def infer_generic_headers(sample_rows, width):
             headers[col] = "Email Address"
         elif digit_like / n > 0.6:
             headers[col] = "Mobile Number"
+        elif bedroom_like / n > 0.6:
+            headers[col] = "Bedrooms"
         elif alpha_multiword / n > 0.6:
             headers[col] = "Name"
         elif code_like / n > 0.6:
