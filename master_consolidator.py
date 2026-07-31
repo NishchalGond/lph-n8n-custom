@@ -64,12 +64,13 @@ HEADER_SYNONYMS = {
                         "tel", "telephone", "phone no", "primary phone",
                         "phone mobile", "mobile 1", "primary mobile number",
                         "poa mobile no."],
-    "Secondary Mobile Number": ["secondary mobile", "secondary phone", "alternate number",
-                                  "alt number", "alternative number", "second contact",
-                                  "other number", "mobile 2", "mobile no.3",
-                                  "mobile phone3", "mobile 3", "poa phone no."],
+    "Alternate Number(s)": ["secondary mobile", "secondary phone", "alternate number",
+                              "alt number", "alternative number", "second contact",
+                              "other number", "mobile 2", "poa phone no.",
+                              "mobile no.3", "mobile phone3", "mobile 3",
+                              "phone 2", "phone no.3"],
     "Telephone Number": ["telephone number", "telephone residence", "telephone office",
-                          "phone 1", "phone 2", "phone no.3", "general"],
+                          "phone 1", "general"],
     "Email Address": ["email", "e-mail", "email address", "e mail", "email add"],
     "Community": ["community", "community name", "master location", "sub community"],
     "Developer": ["developer", "project developer"],
@@ -274,6 +275,18 @@ def find_header_row(rows, max_scan=10):
 
 _BEDROOM_LIKE_RE = re.compile(r"\b(bedroom|studio|\bbr\b|bhk)\b", re.IGNORECASE)
 
+# Curated for this dataset -- DAMAC Hills sub-community names that show up
+# as bare values in headerless sheets (e.g. Park Residences source file).
+# This is NOT a general place-name detector; add more sub-community names
+# here as they turn up in future headerless sheets.
+KNOWN_SUB_COMMUNITY_NAMES = {"richmond", "topanga"}
+
+# Same idea for unit-facing/view values -- confirmed against this dataset's
+# "Front" values. Extend as new facing/view terms show up.
+KNOWN_VIEW_FACING_VALUES = {"front", "back", "side", "corner",
+                              "sea view", "garden view", "pool view",
+                              "park view", "community view", "boulevard view"}
+
 
 def infer_generic_headers(sample_rows, width):
     """For headerless sheets: lightweight type inference per column so data
@@ -304,6 +317,10 @@ def infer_generic_headers(sample_rows, width):
         # by word-count/shape alone. This was misclassifying an entire
         # headerless sheet's bedroom-count column as "Name".
         bedroom_like = sum(1 for v in vals if isinstance(v, str) and _BEDROOM_LIKE_RE.search(v))
+        community_like = sum(1 for v in vals
+                               if isinstance(v, str) and v.strip().lower() in KNOWN_SUB_COMMUNITY_NAMES)
+        view_like = sum(1 for v in vals
+                          if isinstance(v, str) and v.strip().lower() in KNOWN_VIEW_FACING_VALUES)
         alpha_multiword = sum(1 for v in vals
                                if isinstance(v, str) and len(v.split()) >= 2
                                and v.replace(" ", "").isalpha())
@@ -313,6 +330,10 @@ def infer_generic_headers(sample_rows, width):
             headers[col] = "Mobile Number"
         elif bedroom_like / n > 0.6:
             headers[col] = "Bedrooms"
+        elif community_like / n > 0.6:
+            headers[col] = "Community"
+        elif view_like / n > 0.6:
+            headers[col] = "View / Facing"
         elif alpha_multiword / n > 0.6:
             headers[col] = "Name"
         elif code_like / n > 0.6:
@@ -506,6 +527,13 @@ def read_workbook(path, registry, log_entries, processed_registry):
             new_cols_before = set(registry.columns)
             col_map = [registry.canonical_for(h) for h in header]
 
+            # Phone-ish fields where two numbers on the same row should be
+            # combined into one "X / Y" value rather than spawning separate
+            # columns -- Mobile Number stays out of this set deliberately,
+            # since duplicate-detection and phone normalization key off of
+            # it needing to be a single clean value.
+            PHONE_LIKE_CANONICALS = {"Telephone Number", "Alternate Number(s)"}
+
             imported = 0
             for i, row in enumerate(data, start=1):
                 rec = {}
@@ -513,7 +541,32 @@ def read_workbook(path, registry, log_entries, processed_registry):
                     if canon is None:
                         continue
                     val = row[h_idx] if h_idx < len(row) else None
-                    if val is not None and str(val).strip() != "":
+                    if val is None or str(val).strip() == "":
+                        continue
+                    val_str = str(val).strip()
+                    if canon in rec and str(rec[canon]).strip() != val_str:
+                        if canon in PHONE_LIKE_CANONICALS:
+                            # Two numbers for the same field on this row --
+                            # combine into "X / Y" rather than losing one.
+                            existing_parts = [p.strip() for p in str(rec[canon]).split(" / ")]
+                            if val_str not in existing_parts:
+                                rec[canon] = str(rec[canon]) + " / " + val_str
+                        else:
+                            # Two different raw headers in THIS row both
+                            # mapped to the same canonical column with
+                            # different values, and merging text here
+                            # wouldn't make sense (e.g. two different
+                            # Names). Never silently overwrite -- park the
+                            # second value in a clearly numbered sibling
+                            # column so both values survive.
+                            suffix = 2
+                            alt = f"{canon} ({suffix})"
+                            while alt in rec:
+                                suffix += 1
+                                alt = f"{canon} ({suffix})"
+                            rec[alt] = val
+                            registry.ensure_column(alt)
+                    else:
                         rec[canon] = val
                 if not rec:
                     continue
