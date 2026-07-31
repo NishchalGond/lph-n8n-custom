@@ -9,4 +9,5 @@ COPY --from=alpine /etc/apk /etc/apk
 USER root
 RUN apk add --no-cache python3 py3-pip && \
     pip3 install --break-system-packages openpyxl
+COPY master_consolidator.py /opt/scripts/master_consolidator.py
 USER node
