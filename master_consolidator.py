@@ -180,6 +180,34 @@ for _canon, _syns in HEADER_SYNONYMS.items():
 
 _EMAIL_LOOSE_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
+# Sheets whose NAME matches one of these (case-insensitive substring) are
+# never real owner-contact data -- internal notes, instructions, README
+# tabs, dashboards, etc. Skipped entirely regardless of content.
+SKIP_SHEET_NAME_SUBSTRINGS = ["instruction", "readme", "notes", "summary", "dashboard"]
+
+# A row containing any of these (normalized) is a pivot-table artifact
+# ("Row Labels", "Grand Total") -- if found in the first few rows of a
+# sheet, the whole sheet is a pivot table export, not owner records, and
+# gets skipped. This is what let country totals like "200"/"18701" and
+# country names end up looking like real "Name"/count fields earlier.
+_PIVOT_MARKER_NORMS = {"row labels", "column labels", "grand total"}
+
+
+def _sheet_name_excluded(sheet_name):
+    n = str(sheet_name or "").strip().lower()
+    return any(sub in n for sub in SKIP_SHEET_NAME_SUBSTRINGS)
+
+
+def _looks_like_pivot_table(rows, max_scan=5):
+    for row in rows[:max_scan]:
+        for c in row:
+            if c is None:
+                continue
+            norm = normalize_header(c)
+            if norm in _PIVOT_MARKER_NORMS or norm.startswith("count of"):
+                return True
+    return False
+
 
 def _looks_like_data_value(s):
     """True if a cell's shape screams 'this is a data value', e.g. a phone
@@ -367,9 +395,13 @@ def _split_header_and_data(non_empty_rows):
     decide whether row 0 is a real header (find_header_row) or whether the
     sheet is headerless, and return (header, data) either way. Kept as one
     function so the xlsx and csv code paths can never drift out of sync on
-    this logic again."""
+    this logic again. Returns None for a genuinely empty sheet, and the
+    string "PIVOT" if the sheet is a pivot-table export rather than real
+    owner records (caller is responsible for logging/skipping that case)."""
     if not non_empty_rows:
         return None
+    if _looks_like_pivot_table(non_empty_rows):
+        return "PIVOT"
     hdr_idx = find_header_row(non_empty_rows)
     if hdr_idx is None:
         width = max(len(r) for r in non_empty_rows)
@@ -428,6 +460,11 @@ def read_workbook(path, registry, log_entries, processed_registry):
 
     for sheet_name, ws in sheets:
         t0 = time.time()
+        if _sheet_name_excluded(sheet_name):
+            log_entries.append({"file": path.name, "sheet": sheet_name,
+                                 "status": "SKIPPED_EXCLUDED_SHEET_NAME", "rows_imported": 0,
+                                 "timestamp": now_iso(), "duration_sec": round(time.time() - t0, 3)})
+            continue
         sheet_key = f"{file_hash}::{sheet_name}"
         if sheet_key in processed_registry:
             log_entries.append({"file": path.name, "sheet": sheet_name,
@@ -436,6 +473,11 @@ def read_workbook(path, registry, log_entries, processed_registry):
             continue
         try:
             result = read_csv(path) if ext == ".csv" else read_sheet(ws)
+            if result == "PIVOT":
+                log_entries.append({"file": path.name, "sheet": sheet_name,
+                                     "status": "SKIPPED_PIVOT_TABLE", "rows_imported": 0,
+                                     "timestamp": now_iso(), "duration_sec": round(time.time() - t0, 3)})
+                continue
             if result is None:
                 log_entries.append({"file": path.name, "sheet": sheet_name,
                                      "status": "EMPTY_SKIPPED", "rows_imported": 0,
@@ -600,7 +642,14 @@ def consolidate(source_dir, master_path, registry_path, log_path):
 
     combined = existing_records + all_new_records
     detect_duplicates(combined)
-    write_master(master_path, registry.columns, combined)
+    # Columns that are 100% empty across every current row (e.g. a leftover
+    # "Column1" from a past run whose one populating row is gone) add no
+    # value and just clutter the sheet -- drop them from this write. Nothing
+    # is lost: if a future import ever uses that exact header text again,
+    # canonical_for() simply re-creates the column at that point.
+    used_columns = [c for c in registry.columns
+                     if any(r.get(c) not in (None, "") for r in combined)]
+    write_master(master_path, used_columns, combined)
     write_log(log_path, log_entries)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(json.dumps(sorted(processed_registry), indent=2))
@@ -611,7 +660,7 @@ def consolidate(source_dir, master_path, registry_path, log_path):
         "files_scanned": len(files),
         "new_rows_imported": len(all_new_records),
         "total_rows_in_master": len(combined),
-        "total_columns": len(registry.columns),
+        "total_columns": len(used_columns),
         "possible_duplicates_flagged": dup_count,
         "sheets_ok": sum(1 for l in log_entries if l["status"] == "OK"),
         "sheets_empty_skipped": sum(1 for l in log_entries if l["status"] == "EMPTY_SKIPPED"),
