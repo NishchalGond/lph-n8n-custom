@@ -362,6 +362,25 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _split_header_and_data(non_empty_rows):
+    """Shared by read_sheet and read_csv: given a sheet's non-empty rows,
+    decide whether row 0 is a real header (find_header_row) or whether the
+    sheet is headerless, and return (header, data) either way. Kept as one
+    function so the xlsx and csv code paths can never drift out of sync on
+    this logic again."""
+    if not non_empty_rows:
+        return None
+    hdr_idx = find_header_row(non_empty_rows)
+    if hdr_idx is None:
+        width = max(len(r) for r in non_empty_rows)
+        header = infer_generic_headers(non_empty_rows, width)
+        data = non_empty_rows
+    else:
+        header = non_empty_rows[hdr_idx]
+        data = non_empty_rows[hdr_idx + 1:]
+    return header, data
+
+
 def read_sheet(ws):
     """Returns (header_row, data_rows) for one worksheet, or None if the
     sheet is completely empty."""
@@ -371,34 +390,14 @@ def read_sheet(ws):
         if len(rows) > 200000:  # safety cap per sheet; raise for very large sheets
             break
     non_empty_rows = [r for r in rows if any(c is not None and str(c).strip() != "" for c in r)]
-    if not non_empty_rows:
-        return None
-    hdr_idx = find_header_row(non_empty_rows)
-    if hdr_idx is None:
-        width = max(len(r) for r in non_empty_rows)
-        header = infer_generic_headers(non_empty_rows, width)
-        data = non_empty_rows
-    else:
-        header = non_empty_rows[hdr_idx]
-        data = non_empty_rows[hdr_idx + 1:]
-    return header, data
+    return _split_header_and_data(non_empty_rows)
 
 
 def read_csv(path):
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
         rows = list(csv.reader(f))
     non_empty_rows = [r for r in rows if any(c.strip() for c in r)]
-    if not non_empty_rows:
-        return None
-    hdr_idx = find_header_row(non_empty_rows)
-    if hdr_idx is None:
-        width = max(len(r) for r in non_empty_rows)
-        header = infer_generic_headers(non_empty_rows, width)
-        data = non_empty_rows
-    else:
-        header = non_empty_rows[hdr_idx]
-        data = non_empty_rows[hdr_idx + 1:]
-    return header, data
+    return _split_header_and_data(non_empty_rows)
 
 
 def read_workbook(path, registry, log_entries, processed_registry):
@@ -485,12 +484,34 @@ def read_workbook(path, registry, log_entries, processed_registry):
 # ============================================================================
 # MASTER DATABASE READ/WRITE
 # ============================================================================
+def _is_corrupted_column_name(name):
+    """True if a column NAME (not a cell value) looks like it was actually
+    someone's data that got mistaken for a header in an earlier, buggier run
+    -- e.g. "Amjad", "200", "ghaith.albezreh@yahoo.com". Applies the exact
+    same shape rules as looks_like_header's hard vetoes, one column name at a
+    time. This lets load_existing_master self-heal a Master Database that
+    still has old corrupted columns in it, instead of silently carrying that
+    corruption forward on every future run (which is what happened here --
+    the header-detection fix stopped NEW corruption but did nothing about
+    corruption already saved in the file from before the fix existed)."""
+    s = str(name).strip()
+    if _EMAIL_LOOSE_RE.search(s):
+        return True
+    if re.sub(r"[\s]", "", s).isdigit():
+        return True
+    return False
+
+
 def load_existing_master(path):
     """Returns (real_data_columns, records). Meta/enrichment columns are
     deliberately excluded from the returned column list -- they're always
     computed fresh and re-appended by write_master, so feeding them back
     into the SchemaRegistry would pollute the real schema and inflate the
-    column count a little more on every single rerun."""
+    column count a little more on every single rerun. Columns whose NAME
+    itself looks corrupted (see _is_corrupted_column_name) are quarantined
+    the same way: dropped from the schema going forward, though the
+    underlying row data is untouched -- nothing is deleted, the bad column
+    just stops being propagated into every future rebuild."""
     if not path.exists():
         return [], []
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -506,7 +527,8 @@ def load_existing_master(path):
             continue
         records.append(dict(zip(header, rr)))
     reserved = set(META_COLUMNS + ENRICHMENT_COLUMNS)
-    real_columns = [c for c in header if c not in reserved]
+    real_columns = [c for c in header
+                     if c not in reserved and not _is_corrupted_column_name(c)]
     return real_columns, records
 
 
