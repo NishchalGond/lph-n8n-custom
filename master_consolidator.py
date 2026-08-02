@@ -554,14 +554,61 @@ def load_existing_master(path):
     return real_columns, records
 
 
-def write_master(path, columns, records):
+def _sanitize_sheet_name(name, used_names):
+    """Excel sheet names: max 31 chars, no : \\ / ? * [ ] characters, and
+    must be unique within the workbook. Truncates and de-dupes as needed."""
+    s = re.sub(r'[:\\/?*\[\]]', '-', str(name)).strip()
+    if not s:
+        s = "Unassigned"
+    s = s[:31]
+    base = s
+    n = 2
+    while s.lower() in used_names:
+        suffix = f" ({n})"
+        s = base[: 31 - len(suffix)] + suffix
+        n += 1
+    used_names.add(s.lower())
+    return s
+
+
+def _group_key_for(rec):
+    """Grouping priority for the per-community sheets: an explicit Community
+    value, then Project, then the source file name (cleaned up) -- since
+    most rows in this dataset only carry a reliable project identity via
+    which file they came from, not a populated Community/Project column."""
+    for field in ("Community", "Project"):
+        val = rec.get(field)
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+    src = rec.get("_source_file")
+    if src:
+        return re.sub(r"\.(xlsx|xlsm|xls|csv)$", "", str(src), flags=re.IGNORECASE).replace("_", " ").strip()
+    return "Unassigned"
+
+
+def write_master(path, columns, records, group_sheets=True):
     rest_meta = [c for c in META_COLUMNS + ENRICHMENT_COLUMNS if c not in columns and c != "Record ID"]
     ordered_cols = ["Record ID"] + columns + rest_meta
     wb = openpyxl.Workbook(write_only=True)
+
     ws = wb.create_sheet("Master")
     ws.append(ordered_cols)
     for rec in records:
         ws.append([rec.get(c, None) for c in ordered_cols])
+
+    if group_sheets:
+        groups = {}
+        for rec in records:
+            key = _group_key_for(rec)
+            groups.setdefault(key, []).append(rec)
+        used_names = {"master"}
+        for key in sorted(groups.keys(), key=lambda k: (-len(groups[k]), k.lower())):
+            sheet_name = _sanitize_sheet_name(key, used_names)
+            gws = wb.create_sheet(sheet_name)
+            gws.append(ordered_cols)
+            for rec in groups[key]:
+                gws.append([rec.get(c, None) for c in ordered_cols])
+
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
 
