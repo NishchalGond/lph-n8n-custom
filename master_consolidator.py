@@ -22,6 +22,10 @@ Design principles:
     separate columns -- the raw value stays exactly as supplied.
   - A processed-file registry (content hash + sheet name) prevents
     re-ingesting the same sheet twice across repeated runs.
+  - A post-write size/row-count guard flags abnormal master-file growth in
+    the run summary so a future runaway-growth bug gets caught in a
+    Telegram notification instead of surfacing later as an unopenable
+    100MB+ file in Excel.
   - Runs headless from n8n's Execute Command node: takes a JSON config,
     prints exactly one JSON summary line to stdout, and uses exit codes
     (0 = clean, 1 = completed with warnings/errors logged, 2 = fatal) so
@@ -112,6 +116,19 @@ SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".csv"}
 META_COLUMNS = ["Record ID", "_source_file", "_source_sheet", "_source_row", "_ingested_at"]
 ENRICHMENT_COLUMNS = ["Mobile Number (Normalized)", "Email Valid", "Possible Duplicate Of"]
 
+# ----------------------------------------------------------------------------
+# SAFETY GUARD -- after writing the master file, its size and row count are
+# checked against these thresholds. Crossing either one does NOT stop the
+# run or touch the data (nothing here ever blocks a write); it only flags
+# "size_warning": true and a human-readable reason in the JSON summary, so
+# whatever's consuming that summary (the n8n Telegram notify step) surfaces
+# it immediately instead of it going unnoticed until someone can't open the
+# file in Excel. Raise these if the real dataset legitimately grows past
+# them over time -- they're a tripwire for ABNORMAL growth, not a hard cap.
+# ============================================================================
+MAX_SAFE_MASTER_SIZE_MB = 50
+MAX_SAFE_ROW_COUNT = 200_000
+
 
 # ============================================================================
 # HEADER NORMALIZATION
@@ -168,10 +185,6 @@ class SchemaRegistry:
 # ============================================================================
 # HEADER-VS-DATA DETECTION (headerless sheets)
 # ============================================================================
-# Precompute the set of every known synonym (normalized) so header detection
-# can lean on real domain vocabulary rather than a generic text/number guess.
-# This is the strong signal: an actual header cell like "Owner`s Name" or
-# "Contact No." will normalize to something in this set almost every time.
 _KNOWN_HEADER_NORMS = set()
 for _canon, _syns in HEADER_SYNONYMS.items():
     _KNOWN_HEADER_NORMS.add(normalize_header(_canon))
@@ -181,16 +194,8 @@ for _canon, _syns in HEADER_SYNONYMS.items():
 
 _EMAIL_LOOSE_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
-# Sheets whose NAME matches one of these (case-insensitive substring) are
-# never real owner-contact data -- internal notes, instructions, README
-# tabs, dashboards, etc. Skipped entirely regardless of content.
 SKIP_SHEET_NAME_SUBSTRINGS = ["instruction", "readme", "notes", "summary", "dashboard"]
 
-# A row containing any of these (normalized) is a pivot-table artifact
-# ("Row Labels", "Grand Total") -- if found in the first few rows of a
-# sheet, the whole sheet is a pivot table export, not owner records, and
-# gets skipped. This is what let country totals like "200"/"18701" and
-# country names end up looking like real "Name"/count fields earlier.
 _PIVOT_MARKER_NORMS = {"row labels", "column labels", "grand total"}
 
 
@@ -211,50 +216,26 @@ def _looks_like_pivot_table(rows, max_scan=5):
 
 
 def _looks_like_data_value(s):
-    """True if a cell's shape screams 'this is a data value', e.g. a phone
-    number, an email address, a short numeric code/ID, a unit/serial code
-    (letters+digits+hyphens), or a full personal name (two-plus alphabetic
-    words) -- as opposed to a short header label."""
     s = s.strip()
     if _EMAIL_LOOSE_RE.search(s):
-        return True  # contains an email address -- never a header
+        return True
     digits_only = re.sub(r"[^\d]", "", s)
     if digits_only and len(digits_only) >= 4 and len(digits_only) >= len(s) - 3:
-        return True  # phone-number- or numeric-code-shaped (e.g. "53", "493996",
-                      # "971 569346555") -- lowered from a 7-digit floor because
-                      # short numeric IDs/codes were previously slipping through
-                      # and getting miscounted as header-like labels
+        return True
     if re.match(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+){2,}$", s):
-        return True  # code-shaped, e.g. SC-YN7-CON-CR48-101
+        return True
     words = s.split()
     if len(words) >= 2 and all(w.isalpha() for w in words):
-        return True  # full-name-shaped, e.g. "SHAIKHA ALMARZOOQI" / "Ahmed Ali"
+        return True
     return False
 
 
 def looks_like_header(row):
-    """A real header row either contains a cell matching known field
-    vocabulary (Name, Mobile Number, Email, etc. and their synonyms -- the
-    strong signal), or, failing that, is mostly short labels that don't look
-    like phone numbers, codes, emails, or personal names (the fallback
-    signal). Guards against sheets whose first row is already data, which
-    would otherwise be misread as a header and silently dropped -- and,
-    just as importantly, guards against an actual DATA row (someone's real
-    name/email/phone number) being misread as a header, which would turn
-    private data into permanent column names across the whole database."""
     non_empty = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
     if len(non_empty) < 2:
         return False
-    # Hard veto: a row containing an email address is never a real header,
-    # regardless of how many other cells look label-like.
     if any(_EMAIL_LOOSE_RE.search(c) for c in non_empty):
         return False
-    # Hard veto: a row containing a bare numeric value (any length -- "53",
-    # "200", "493996") is never a real header either. Real header labels are
-    # words/phrases; a naked number in a header row means this is actually a
-    # data row (an ID, unit count, code, etc.) that slipped past the other
-    # checks. This is what let single names like "Amjad" paired with a short
-    # code like "200" get misread as a header on some sheets.
     if any(re.sub(r"[\s]", "", c).isdigit() for c in non_empty):
         return False
     if any(normalize_header(c) in _KNOWN_HEADER_NORMS for c in non_empty):
@@ -264,9 +245,6 @@ def looks_like_header(row):
 
 
 def find_header_row(rows, max_scan=10):
-    """Scan the first few rows for one that looks like a real header. Returns
-    None if no row looks header-like -- caller must treat the sheet as
-    headerless rather than risk dropping real data as a fake header."""
     for i, row in enumerate(rows[:max_scan]):
         if looks_like_header(row):
             return i
@@ -275,22 +253,14 @@ def find_header_row(rows, max_scan=10):
 
 _BEDROOM_LIKE_RE = re.compile(r"\b(bedroom|studio|\bbr\b|bhk)\b", re.IGNORECASE)
 
-# Curated for this dataset -- DAMAC Hills sub-community names that show up
-# as bare values in headerless sheets (e.g. Park Residences source file).
-# This is NOT a general place-name detector; add more sub-community names
-# here as they turn up in future headerless sheets.
 KNOWN_SUB_COMMUNITY_NAMES = {"richmond", "topanga"}
 
-# Same idea for unit-facing/view values -- confirmed against this dataset's
-# "Front" values. Extend as new facing/view terms show up.
 KNOWN_VIEW_FACING_VALUES = {"front", "back", "side", "corner",
                               "sea view", "garden view", "pool view",
                               "park view", "community view", "boulevard view"}
 
 
 def infer_generic_headers(sample_rows, width):
-    """For headerless sheets: lightweight type inference per column so data
-    still lands in a sensible bucket instead of being lost under 'Column N'."""
     headers = [None] * width
     for col in range(width):
         vals = [r[col] for r in sample_rows[:30]
@@ -303,19 +273,9 @@ def infer_generic_headers(sample_rows, width):
                           if str(v).replace(" ", "").replace("+", "").isdigit()
                           and len(str(v).replace(" ", "")) >= 7)
         email_like = sum(1 for v in vals if _EMAIL_LOOSE_RE.search(str(v)))
-        # Codes like "PRK1/2E416F" -- allow "/" alongside "-" since real unit
-        # codes in this data use both separators. Spaces are stripped first
-        # because a handful of source rows have stray spaces mid-code
-        # (e.g. "PRKI /SD119/2F558F").
         code_like = sum(1 for v in vals
                           if re.match(r"^[A-Za-z0-9/\-]{4,}$", str(v).strip().replace(" ", ""))
                           and any(ch.isdigit() for ch in str(v)))
-        # "Four Bedroom", "Studio", "2 BHK" etc. are unit-type descriptions,
-        # not personal names -- checked BEFORE the name check below, since a
-        # phrase like "Four Bedroom" is two alphabetic words and would
-        # otherwise be indistinguishable from a real name like "Ahmed Ali"
-        # by word-count/shape alone. This was misclassifying an entire
-        # headerless sheet's bedroom-count column as "Name".
         bedroom_like = sum(1 for v in vals if isinstance(v, str) and _BEDROOM_LIKE_RE.search(v))
         community_like = sum(1 for v in vals
                                if isinstance(v, str) and v.strip().lower() in KNOWN_SUB_COMMUNITY_NAMES)
@@ -347,8 +307,6 @@ def infer_generic_headers(sample_rows, width):
 # NON-DESTRUCTIVE ENRICHMENT (PLUGIN POINTS)
 # ============================================================================
 def normalize_uae_phone(raw):
-    """Best-effort UAE phone normalization for a NEW column -- never touches
-    the original value. Returns None if it doesn't look like a phone at all."""
     if raw is None or str(raw).strip() == "":
         return None
     digits = re.sub(r"[^\d]", "", str(raw))
@@ -360,7 +318,7 @@ def normalize_uae_phone(raw):
         return "+" + digits
     if digits.startswith("0"):
         return "+971" + digits[1:]
-    if len(digits) == 9:  # local number missing leading 0
+    if len(digits) == 9:
         return "+971" + digits
     if len(digits) >= 8:
         return "+" + digits
@@ -377,7 +335,6 @@ def is_valid_email(raw):
 
 
 def enrich_record(rec):
-    """Adds enrichment columns in place without ever altering original fields."""
     mobile = rec.get("Mobile Number")
     if mobile is not None:
         norm = normalize_uae_phone(mobile)
@@ -389,10 +346,6 @@ def enrich_record(rec):
 
 
 def detect_duplicates(records):
-    """Cross-file duplicate detection by normalized phone or email. Flags
-    (does not merge/delete) so nothing is ever lost -- just surfaced for
-    manual review. Populates 'Possible Duplicate Of' with the row number(s)
-    of earlier matching records."""
     seen_phone = {}
     seen_email = {}
     for idx, rec in enumerate(records):
@@ -411,7 +364,7 @@ def detect_duplicates(records):
             else:
                 seen_email[key] = idx
         if matches:
-            rec["Possible Duplicate Of"] = ", ".join(str(m + 2) for m in sorted(matches))  # +2: header row + 1-index
+            rec["Possible Duplicate Of"] = ", ".join(str(m + 2) for m in sorted(matches))
 
 
 # ============================================================================
@@ -430,13 +383,6 @@ def now_iso():
 
 
 def _split_header_and_data(non_empty_rows):
-    """Shared by read_sheet and read_csv: given a sheet's non-empty rows,
-    decide whether row 0 is a real header (find_header_row) or whether the
-    sheet is headerless, and return (header, data) either way. Kept as one
-    function so the xlsx and csv code paths can never drift out of sync on
-    this logic again. Returns None for a genuinely empty sheet, and the
-    string "PIVOT" if the sheet is a pivot-table export rather than real
-    owner records (caller is responsible for logging/skipping that case)."""
     if not non_empty_rows:
         return None
     if _looks_like_pivot_table(non_empty_rows):
@@ -453,12 +399,10 @@ def _split_header_and_data(non_empty_rows):
 
 
 def read_sheet(ws):
-    """Returns (header_row, data_rows) for one worksheet, or None if the
-    sheet is completely empty."""
     rows = []
     for row in ws.iter_rows(values_only=True):
         rows.append(row)
-        if len(rows) > 200000:  # safety cap per sheet; raise for very large sheets
+        if len(rows) > 200000:
             break
     non_empty_rows = [r for r in rows if any(c is not None and str(c).strip() != "" for c in r)]
     return _split_header_and_data(non_empty_rows)
@@ -472,9 +416,6 @@ def read_csv(path):
 
 
 def read_workbook(path, registry, log_entries, processed_registry):
-    """Reads every worksheet (including hidden) in one workbook. Returns list
-    of normalized record dicts. Never raises -- errors are logged per sheet
-    so one bad sheet never stops the run."""
     records = []
     ext = path.suffix.lower()
     try:
@@ -527,11 +468,6 @@ def read_workbook(path, registry, log_entries, processed_registry):
             new_cols_before = set(registry.columns)
             col_map = [registry.canonical_for(h) for h in header]
 
-            # Phone-ish fields where two numbers on the same row should be
-            # combined into one "X / Y" value rather than spawning separate
-            # columns -- Mobile Number stays out of this set deliberately,
-            # since duplicate-detection and phone normalization key off of
-            # it needing to be a single clean value.
             PHONE_LIKE_CANONICALS = {"Telephone Number", "Alternate Number(s)"}
 
             imported = 0
@@ -546,19 +482,10 @@ def read_workbook(path, registry, log_entries, processed_registry):
                     val_str = str(val).strip()
                     if canon in rec and str(rec[canon]).strip() != val_str:
                         if canon in PHONE_LIKE_CANONICALS:
-                            # Two numbers for the same field on this row --
-                            # combine into "X / Y" rather than losing one.
                             existing_parts = [p.strip() for p in str(rec[canon]).split(" / ")]
                             if val_str not in existing_parts:
                                 rec[canon] = str(rec[canon]) + " / " + val_str
                         else:
-                            # Two different raw headers in THIS row both
-                            # mapped to the same canonical column with
-                            # different values, and merging text here
-                            # wouldn't make sense (e.g. two different
-                            # Names). Never silently overwrite -- park the
-                            # second value in a clearly numbered sibling
-                            # column so both values survive.
                             suffix = 2
                             alt = f"{canon} ({suffix})"
                             while alt in rec:
@@ -589,7 +516,7 @@ def read_workbook(path, registry, log_entries, processed_registry):
             log_entries.append({"file": path.name, "sheet": sheet_name, "status": "ERROR",
                                  "error": str(e), "rows_imported": 0, "timestamp": now_iso(),
                                  "duration_sec": round(time.time() - t0, 3)})
-            continue  # one bad sheet never stops the run
+            continue
 
     return records
 
@@ -598,15 +525,6 @@ def read_workbook(path, registry, log_entries, processed_registry):
 # MASTER DATABASE READ/WRITE
 # ============================================================================
 def _is_corrupted_column_name(name):
-    """True if a column NAME (not a cell value) looks like it was actually
-    someone's data that got mistaken for a header in an earlier, buggier run
-    -- e.g. "Amjad", "200", "ghaith.albezreh@yahoo.com". Applies the exact
-    same shape rules as looks_like_header's hard vetoes, one column name at a
-    time. This lets load_existing_master self-heal a Master Database that
-    still has old corrupted columns in it, instead of silently carrying that
-    corruption forward on every future run (which is what happened here --
-    the header-detection fix stopped NEW corruption but did nothing about
-    corruption already saved in the file from before the fix existed)."""
     s = str(name).strip()
     if _EMAIL_LOOSE_RE.search(s):
         return True
@@ -616,15 +534,6 @@ def _is_corrupted_column_name(name):
 
 
 def load_existing_master(path):
-    """Returns (real_data_columns, records). Meta/enrichment columns are
-    deliberately excluded from the returned column list -- they're always
-    computed fresh and re-appended by write_master, so feeding them back
-    into the SchemaRegistry would pollute the real schema and inflate the
-    column count a little more on every single rerun. Columns whose NAME
-    itself looks corrupted (see _is_corrupted_column_name) are quarantined
-    the same way: dropped from the schema going forward, though the
-    underlying row data is untouched -- nothing is deleted, the bad column
-    just stops being propagated into every future rebuild."""
     if not path.exists():
         return [], []
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -678,7 +587,7 @@ def consolidate(source_dir, master_path, registry_path, log_path):
         try:
             processed_registry = set(json.loads(registry_path.read_text()))
         except Exception:
-            processed_registry = set()  # corrupt registry -> safest is to start fresh, not crash
+            processed_registry = set()
 
     registry = SchemaRegistry(existing_columns=existing_cols)
     log_entries = []
@@ -687,11 +596,6 @@ def consolidate(source_dir, master_path, registry_path, log_path):
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
 
-    # Record ID is a stable, append-only synthetic primary key -- existing
-    # rows KEEP whatever ID they were already assigned (never renumbered);
-    # new rows continue the sequence from the current highest ID. This is
-    # what makes it safe to use "Record ID" to key against this Master
-    # Database from other systems/future imports across repeated runs.
     next_id = 1
     for r in existing_records:
         try:
@@ -713,11 +617,6 @@ def consolidate(source_dir, master_path, registry_path, log_path):
 
     combined = existing_records + all_new_records
     detect_duplicates(combined)
-    # Columns that are 100% empty across every current row (e.g. a leftover
-    # "Column1" from a past run whose one populating row is gone) add no
-    # value and just clutter the sheet -- drop them from this write. Nothing
-    # is lost: if a future import ever uses that exact header text again,
-    # canonical_for() simply re-creates the column at that point.
     used_columns = [c for c in registry.columns
                      if any(r.get(c) not in (None, "") for r in combined)]
     write_master(master_path, used_columns, combined)
@@ -725,9 +624,23 @@ def consolidate(source_dir, master_path, registry_path, log_path):
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(json.dumps(sorted(processed_registry), indent=2))
 
+    # --------------------------------------------------------------------
+    # SAFETY GUARD: check what actually landed on disk, not what we think
+    # we wrote. Runs every time, costs nothing, never blocks a write --
+    # only makes abnormal growth visible instead of silent.
+    # --------------------------------------------------------------------
+    try:
+        master_file_size_mb = round(master_path.stat().st_size / (1024 * 1024), 2)
+    except OSError:
+        master_file_size_mb = None
+    size_warning = bool(
+        (master_file_size_mb is not None and master_file_size_mb > MAX_SAFE_MASTER_SIZE_MB)
+        or len(combined) > MAX_SAFE_ROW_COUNT
+    )
+
     dup_count = sum(1 for r in combined if r.get("Possible Duplicate Of"))
     summary = {
-        "status": "ok",
+        "status": "warning_large_master" if size_warning else "ok",
         "files_scanned": len(files),
         "new_rows_imported": len(all_new_records),
         "total_rows_in_master": len(combined),
@@ -740,6 +653,8 @@ def consolidate(source_dir, master_path, registry_path, log_path):
         "errors": [l for l in log_entries if l["status"] == "ERROR"],
         "master_path": str(master_path),
         "log_path": str(log_path),
+        "master_file_size_mb": master_file_size_mb,
+        "size_warning": size_warning,
     }
     return summary
 
@@ -779,7 +694,7 @@ def main():
 
         summary = consolidate(source_dir, master_path, registry_path, log_path)
         print(json.dumps(summary))
-        sys.exit(1 if summary["sheets_errored"] > 0 else 0)
+        sys.exit(1 if (summary["sheets_errored"] > 0 or summary["size_warning"]) else 0)
 
     except Exception as e:
         print(json.dumps({"status": "fatal_error", "error": str(e)}))
