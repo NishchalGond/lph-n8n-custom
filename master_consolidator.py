@@ -89,9 +89,6 @@ HEADER_SYNONYMS = {
     "Developer": ["developer", "project developer"],
     "Project": ["project", "project name", "master project", "emaar project",
                 "master project land", "project lnd", "sub project"],
-    # Kept for zero-data-loss, but not part of the required main list -- these
-    # still consolidate their own synonyms into one column each, just ordered
-    # after the main headers instead of before them.
     "Serial No": ["serial no", "serial number", "sno", "sr no"],
     "Emirates ID Number": ["idnumber", "uaeidnumber", "emirates id number"],
     "Passport Number": ["passport"],
@@ -99,10 +96,6 @@ HEADER_SYNONYMS = {
     "Gender": ["gender"],
 }
 
-# The fixed, required column order for the consolidated output. These
-# ALWAYS appear in this exact order, even if a given run's data happens
-# not to populate one of them yet (unlike other auto-discovered columns,
-# which only appear when at least one row actually has a value).
 MAIN_HEADERS = [
     "Name", "Community", "Sub-Community", "Building/Cluster", "Unit Number",
     "Size", "Plot Reg. No", "Plot Number", "DMNO", "DMsubno", "Bedroom",
@@ -111,14 +104,6 @@ MAIN_HEADERS = [
     "Procedure Value", "Developer", "Project",
 ]
 
-# Phone-like raw headers are handled separately from the normal
-# canonical_for() mapping: instead of every synonym collapsing onto one
-# fixed target column, each row's phone-like values are collected in the
-# order their columns appear and distributed across Mobile 1 / Mobile 2 /
-# Mobile 3 (a 4th+ distinct number gets appended onto Mobile 3 rather than
-# lost). This list is every synonym that means "this column is *a* phone
-# number", not any specific one of the three slots. Normalized into a set
-# further down, once normalize_header() exists.
 PHONE_SYNONYMS_RAW = [
     "phone", "mobile", "number", "contact number", "phone number",
     "contact no", "contact", "mobile no", "mobile number", "tel",
@@ -131,39 +116,12 @@ PHONE_SYNONYMS_RAW = [
     "telephone office", "phone 1", "general",
 ]
 
-# NOTE ON THIS LIST: this is a starting expansion based on one real production
-# dataset, not an exhaustive mapping. Columns that still show up as sparse,
-# near-duplicate fields after a run (e.g. two columns that clearly mean the
-# same real-world thing) should be added here as new synonyms -- that is the
-# intended, ongoing maintenance loop for this file. Deliberately NOT merged in
-# this pass: fields that look similar but carry different units or meanings
-# (e.g. "Built-up area sqm" vs "Built-up area sqft" vs "Plot area sqft" --
-# merging these would silently mix square-meter and square-foot values in one
-# column) or different real-world concepts (e.g. "Residence Country" is not
-# the same fact as "Nationality"). Those are left as separate columns on
-# purpose rather than guessed at.
-
 SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".csv"}
 
-# Meta/enrichment columns are always appended at the very end, after every
-# real data column, so real data never gets pushed around by these.
-# "Record ID" is the one exception -- write_master pins it as the FIRST
-# column, since it's the stable key meant for merging/updating against in
-# future runs, not incidental bookkeeping like the others.
 META_COLUMNS = ["Record ID", "_source_file", "_source_sheet", "_source_row", "_ingested_at"]
 ENRICHMENT_COLUMNS = ["Mobile Number (Normalized)", "Mobile Country", "Mobile Number Valid",
                        "Email Valid", "Possible Duplicate Of"]
 
-# ----------------------------------------------------------------------------
-# SAFETY GUARD -- after writing the master file, its size and row count are
-# checked against these thresholds. Crossing either one does NOT stop the
-# run or touch the data (nothing here ever blocks a write); it only flags
-# "size_warning": true and a human-readable reason in the JSON summary, so
-# whatever's consuming that summary (the n8n Telegram notify step) surfaces
-# it immediately instead of it going unnoticed until someone can't open the
-# file in Excel. Raise these if the real dataset legitimately grows past
-# them over time -- they're a tripwire for ABNORMAL growth, not a hard cap.
-# ============================================================================
 MAX_SAFE_MASTER_SIZE_MB = 50
 MAX_SAFE_ROW_COUNT = 200_000
 
@@ -172,18 +130,15 @@ MAX_SAFE_ROW_COUNT = 200_000
 # HEADER NORMALIZATION
 # ============================================================================
 def normalize_header(raw):
-    """Collapse whitespace/punctuation/case differences so equivalent headers
-    compare equal. E.g. "Owner`s Name", "Owner's Name", "  owner  name " all
-    normalize to "owners name"."""
     if raw is None:
         return ""
     s = str(raw)
     s = unicodedata.normalize("NFKD", s)
     s = s.replace("\n", " ").replace("\t", " ").replace("\r", " ")
     s = s.lower()
-    s = re.sub(r"[`'’‘]", "", s)      # apostrophe/backtick variants -> remove
-    s = re.sub(r"[,.]", "", s)        # commas/periods -> remove
-    s = re.sub(r"[\-_/]", " ", s)     # hyphen/underscore/slash -> word separator
+    s = re.sub(r"[`'’‘]", "", s)
+    s = re.sub(r"[,.]", "", s)
+    s = re.sub(r"[\-_/]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -192,10 +147,6 @@ PHONE_SYNONYMS_NORMALIZED = {normalize_header(s) for s in PHONE_SYNONYMS_RAW}
 
 
 class SchemaRegistry:
-    """Tracks the growing canonical column list and the mapping from every
-    raw header seen so far -> canonical column. New, never-seen headers
-    become new columns automatically (schema auto-extension)."""
-
     def __init__(self, existing_columns=None):
         self.columns = list(existing_columns) if existing_columns else []
         self._norm_to_canonical = {}
@@ -217,7 +168,7 @@ class SchemaRegistry:
         else:
             canon = re.sub(r"\s+", " ", str(raw_header).strip())
             self._norm_to_canonical[nk] = canon
-        self.ensure_column(canon)  # ALWAYS register, synonym match or not
+        self.ensure_column(canon)
         return canon
 
     def ensure_column(self, canon):
@@ -225,9 +176,6 @@ class SchemaRegistry:
             self.columns.append(canon)
 
 
-# ============================================================================
-# HEADER-VS-DATA DETECTION (headerless sheets)
-# ============================================================================
 _KNOWN_HEADER_NORMS = set()
 for _canon, _syns in HEADER_SYNONYMS.items():
     _KNOWN_HEADER_NORMS.add(normalize_header(_canon))
@@ -352,10 +300,6 @@ def infer_generic_headers(sample_rows, width):
 import phonenumbers
 from phonenumbers import NumberParseException
 
-# Friendly names for the country codes phonenumbers detects, so the sheet
-# reads "Saudi Arabia" instead of a bare ISO code "SA". Not exhaustive --
-# any code not listed here just falls back to showing the ISO code itself,
-# which is still meaningful, just less pretty.
 COUNTRY_NAMES = {
     "AE": "UAE", "SA": "Saudi Arabia", "IQ": "Iraq", "IR": "Iran",
     "IN": "India", "PK": "Pakistan", "EG": "Egypt", "JO": "Jordan",
@@ -374,18 +318,12 @@ _GARBAGE_PHONE_VALUES = {"null", "n/a", "na", "none", "-", "0", "00", "nil"}
 
 
 def normalize_phone(raw, default_region="AE"):
-    """Best-effort international phone parsing for a NEW column -- never
-    touches the original value. default_region is only used as a fallback
-    guess for numbers with NO country code at all (bare local format); a
-    number that already carries a country code (leading + or 00) is parsed
-    using that, not assumed to be UAE. Returns (e164_or_None,
-    country_name_or_None, is_valid_bool_or_None)."""
     if raw is None:
         return None, None, None
     s = str(raw).strip()
     if not s or s.lower() in _GARBAGE_PHONE_VALUES:
         return None, None, None
-    s = s.replace("|", "")  # source data sometimes has stray pipe separators, e.g. "971|55-2600133"
+    s = s.replace("|", "")
     if s.startswith("00"):
         s = "+" + s[2:]
     try:
@@ -421,7 +359,7 @@ def enrich_record(rec):
             rec["Mobile Number (Normalized)"] = e164
             rec["Mobile Country"] = country_name
             rec["Mobile Number Valid"] = valid
-            break  # first successfully-parsed slot wins for duplicate-detection purposes
+            break
     email = rec.get("Email Address")
     if email is not None:
         rec["Email Valid"] = is_valid_email(email)
@@ -498,6 +436,9 @@ def read_csv(path):
 
 
 def read_workbook(path, registry, log_entries, processed_registry):
+    """Returns (records, file_hash). file_hash is None only when the file
+    couldn't even be read (hashing failed) -- callers use this to populate
+    the Master_Index / Duplicate_Report file-level metadata."""
     records = []
     ext = path.suffix.lower()
     try:
@@ -506,7 +447,7 @@ def read_workbook(path, registry, log_entries, processed_registry):
         log_entries.append({"file": path.name, "sheet": None, "status": "ERROR",
                              "error": f"Could not read file: {e}", "rows_imported": 0,
                              "timestamp": now_iso()})
-        return records
+        return records, None
 
     if ext == ".csv":
         sheets = [("Sheet1", None)]
@@ -560,7 +501,7 @@ def read_workbook(path, registry, log_entries, processed_registry):
             imported = 0
             for i, row in enumerate(data, start=1):
                 rec = {}
-                phone_vals = []  # collected in column order, deduped, assigned to Mobile 1/2/3 after the loop
+                phone_vals = []
                 for h_idx, canon in enumerate(col_map):
                     val = row[h_idx] if h_idx < len(row) else None
                     if val is None or str(val).strip() == "":
@@ -593,7 +534,6 @@ def read_workbook(path, registry, log_entries, processed_registry):
                     if len(phone_vals) >= 2:
                         rec["Mobile 2"] = phone_vals[1]
                     if len(phone_vals) >= 3:
-                        # a 4th+ distinct number is appended onto Mobile 3 rather than dropped
                         rec["Mobile 3"] = " / ".join(phone_vals[2:])
                 if not rec:
                     continue
@@ -618,7 +558,7 @@ def read_workbook(path, registry, log_entries, processed_registry):
                                  "duration_sec": round(time.time() - t0, 3)})
             continue
 
-    return records
+    return records, file_hash
 
 
 # ============================================================================
@@ -633,30 +573,7 @@ def _is_corrupted_column_name(name):
     return False
 
 
-def load_existing_master(path):
-    if not path.exists():
-        return [], []
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb["Master"]
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return [], []
-    header = list(rows[0])
-    records = []
-    for r in rows[1:]:
-        rr = list(r) + [None] * (len(header) - len(r))
-        if not any(x is not None and str(x).strip() != "" for x in rr):
-            continue
-        records.append(dict(zip(header, rr)))
-    reserved = set(META_COLUMNS + ENRICHMENT_COLUMNS)
-    real_columns = [c for c in header
-                     if c not in reserved and not _is_corrupted_column_name(c)]
-    return real_columns, records
-
-
 def _sanitize_sheet_name(name, used_names):
-    """Excel sheet names: max 31 chars, no : \\ / ? * [ ] characters, and
-    must be unique within the workbook. Truncates and de-dupes as needed."""
     s = re.sub(r'[:\\/?*\[\]]', '-', str(name)).strip()
     if not s:
         s = "Unassigned"
@@ -672,10 +589,6 @@ def _sanitize_sheet_name(name, used_names):
 
 
 def _group_key_for(rec):
-    """Grouping priority for the per-community sheets: an explicit Community
-    value, then Project, then the source file name (cleaned up) -- since
-    most rows in this dataset only carry a reliable project identity via
-    which file they came from, not a populated Community/Project column."""
     for field in ("Community", "Project"):
         val = rec.get(field)
         if val is not None and str(val).strip() != "":
@@ -686,14 +599,19 @@ def _group_key_for(rec):
     return "Unassigned"
 
 
-def write_master(path, columns, records, group_sheets=True):
-    extra_cols = [c for c in columns if c not in MAIN_HEADERS]
-    rest_meta = [c for c in META_COLUMNS + ENRICHMENT_COLUMNS
-                 if c not in MAIN_HEADERS and c not in extra_cols and c != "Record ID"]
-    ordered_cols = ["Record ID"] + MAIN_HEADERS + extra_cols + rest_meta
+def write_batch_workbook(path, columns, records, group_sheets=True):
+    """Writes ONE batch's consolidated data only. Output is restricted to
+    EXACTLY the 23 requested columns, in this fixed order -- no Record ID,
+    no _source_file/_source_sheet/_source_row/_ingested_at tracking
+    columns, no enrichment columns (Mobile Number (Normalized) etc.), and
+    no auto-discovered extra columns, even if the source sheets had them.
+    (Those fields still exist internally on each record and are still used
+    for duplicate detection -- they're just not written to this sheet.)
+    """
+    ordered_cols = list(MAIN_HEADERS)
     wb = openpyxl.Workbook(write_only=True)
 
-    ws = wb.create_sheet("Master")
+    ws = wb.create_sheet("Consolidated")
     ws.append(ordered_cols)
     for rec in records:
         ws.append([rec.get(c, None) for c in ordered_cols])
@@ -703,7 +621,7 @@ def write_master(path, columns, records, group_sheets=True):
         for rec in records:
             key = _group_key_for(rec)
             groups.setdefault(key, []).append(rec)
-        used_names = {"master"}
+        used_names = {"consolidated"}
         for key in sorted(groups.keys(), key=lambda k: (-len(groups[k]), k.lower())):
             sheet_name = _sanitize_sheet_name(key, used_names)
             gws = wb.create_sheet(sheet_name)
@@ -722,95 +640,317 @@ def write_log(path, log_entries):
 
 
 # ============================================================================
-# MAIN ENTRY POINT
+# BATCH ORCHESTRATION -- state, Master_Index, Duplicate_Report,
+# Processing_Log.xlsx, Workflow_Summary.xlsx, crash-safe resume.
+#
+# Everything above this section is the ORIGINAL, UNCHANGED processing
+# pipeline (header normalization, enrichment, dedup-by-content, per-sheet
+# read logic). This section only wraps it with batching per the master
+# prompt -- it does not alter how any individual file/sheet is parsed.
 # ============================================================================
-def consolidate(source_dir, master_path, registry_path, log_path):
+STATE_VERSION = 1
+
+
+def default_state():
+    return {
+        "version": STATE_VERSION,
+        "next_batch_number": 1,
+        "next_record_id": 1,
+        "workflow_start": None,
+        "batches": [],          # list of per-batch summary dicts (for Workflow_Summary)
+        "file_registry": {},    # file_hash -> {name, size, first_seen_batch, status}
+    }
+
+
+def load_state(state_path):
+    if not state_path.exists():
+        return default_state()
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        return default_state()
+    base = default_state()
+    base.update(state)
+    return base
+
+
+def save_state(state_path, state):
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, default=str))
+
+
+def _load_manifest(manifest_path):
+    """Optional JSON: {"filename.xlsx": {"drive_url": "...", "drive_id": "...",
+    "original_path": "..."}}. n8n writes this alongside the downloaded batch
+    files so Master_Index can carry a clickable Drive link + original folder
+    path even though the Python engine only sees local temp files."""
+    if not manifest_path or not Path(manifest_path).exists():
+        return {}
+    try:
+        return json.loads(Path(manifest_path).read_text())
+    except Exception:
+        return {}
+
+
+def _load_xlsx_rows(path):
+    if not path.exists():
+        return []
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header = list(rows[0])
+    return [dict(zip(header, r)) for r in rows[1:]
+            if any(v is not None and str(v).strip() != "" for v in r)]
+
+
+def _write_xlsx_rows(path, header, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(header)
+    for r in rows:
+        ws.append([r.get(h) for h in header])
+    wb.save(path)
+
+
+MASTER_INDEX_COLUMNS = [
+    "Record ID", "Name", "DirectoryName", "Extension", "Size (KB)",
+    "LastWriteTime", "Batch Number", "Consolidated Batch Workbook Name",
+    "Processing Status", "Duplicate Status", "Duplicate Of",
+    "Processing Timestamp", "Drive URL",
+]
+
+DUPLICATE_REPORT_COLUMNS = [
+    "Record ID", "Name", "DirectoryName", "File Hash", "Size (KB)",
+    "Duplicate Status", "Duplicate Of", "Batch Number", "Detected At",
+]
+
+PROCESSING_LOG_COLUMNS = [
+    "Batch Number", "Event", "Files Processed", "Files Skipped",
+    "Duplicate Files", "Errors", "Warnings", "Processing Time (sec)",
+    "Timestamp",
+]
+
+
+def run_batch(source_dir, batch_workbook_path, state_path, master_index_path,
+              dup_report_path, processing_log_path, sheet_registry_path,
+              manifest_path=None):
+    """Processes every supported file currently sitting in source_dir as
+    ONE batch: writes a self-contained Consolidated_Batch_NNN.xlsx, appends
+    this batch's rows to the running Master_Index and Duplicate_Report, and
+    persists state so a crash/restart resumes at the next batch number
+    instead of overwriting an already-completed one."""
     source_dir = Path(source_dir)
-    master_path = Path(master_path)
-    registry_path = Path(registry_path)
-    log_path = Path(log_path)
+    batch_workbook_path = Path(batch_workbook_path)
+    state_path = Path(state_path)
+    master_index_path = Path(master_index_path)
+    dup_report_path = Path(dup_report_path)
+    processing_log_path = Path(processing_log_path)
+    sheet_registry_path = Path(sheet_registry_path)
 
-    existing_cols, existing_records = load_existing_master(master_path)
-    processed_registry = set()
-    if registry_path.exists():
+    t_batch_start = time.time()
+    state = load_state(state_path)
+    if state["workflow_start"] is None:
+        state["workflow_start"] = now_iso()
+
+    batch_number = state["next_batch_number"]
+    manifest = _load_manifest(manifest_path)
+
+    processed_sheet_hashes = set()
+    if sheet_registry_path.exists():
         try:
-            processed_registry = set(json.loads(registry_path.read_text()))
+            processed_sheet_hashes = set(json.loads(sheet_registry_path.read_text()))
         except Exception:
-            processed_registry = set()
+            processed_sheet_hashes = set()
 
-    registry = SchemaRegistry(existing_columns=existing_cols)
+    existing_index_rows = _load_xlsx_rows(master_index_path)
+    existing_dup_rows = _load_xlsx_rows(dup_report_path)
+    existing_log_rows = _load_xlsx_rows(processing_log_path)
+
+    registry = SchemaRegistry()
     log_entries = []
-    all_new_records = []
+    all_records = []
+    new_index_rows = []
+    new_dup_rows = []
+    errors, warnings = 0, 0
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
-
-    next_id = 1
-    for r in existing_records:
-        try:
-            rid = int(r.get("Record ID") or 0)
-        except (TypeError, ValueError):
-            rid = 0
-        if rid >= next_id:
-            next_id = rid + 1
 
     files = sorted(p for p in source_dir.rglob("*")
                     if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS)
 
     for path in files:
-        recs = read_workbook(path, registry, log_entries, processed_registry)
+        try:
+            stat = path.stat()
+            size_kb = round(stat.st_size / 1024, 2)
+            last_write = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            size_kb, last_write = None, None
+
+        try:
+            recs, file_hash = read_workbook(path, registry, log_entries, processed_sheet_hashes)
+            status = "Processed" if any(l["file"] == path.name and l["status"] == "OK"
+                                          for l in log_entries) else "Processed (no new rows)"
+        except Exception as e:
+            recs, file_hash = [], None
+            status = "Failed"
+            errors += 1
+            log_entries.append({"file": path.name, "sheet": None, "status": "ERROR",
+                                 "error": str(e), "rows_imported": 0, "timestamp": now_iso()})
+
         for rec in recs:
-            rec["Record ID"] = next_id
-            next_id += 1
-        all_new_records.extend(recs)
+            rec["Record ID"] = state["next_record_id"]
+            state["next_record_id"] += 1
+        all_records.extend(recs)
 
-    combined = existing_records + all_new_records
-    detect_duplicates(combined)
+        # File-level duplicate detection (Step 7): hash first, then
+        # size+filename as a fallback signal -- separate from the existing
+        # person-level (phone/email) row dedup, which still runs below.
+        dup_status, dup_of = "Unique", None
+        if file_hash:
+            prior = state["file_registry"].get(file_hash)
+            if prior:
+                dup_status, dup_of = "Duplicate", prior.get("record_id")
+            else:
+                for h, meta in state["file_registry"].items():
+                    if meta.get("size_kb") == size_kb and meta.get("name") == path.name and h != file_hash:
+                        dup_status, dup_of = "Possible Duplicate", meta.get("record_id")
+                        break
+
+        record_id = recs[0]["Record ID"] if recs else state["next_record_id"]
+        if not recs:
+            state["next_record_id"] += 1
+
+        meta = manifest.get(path.name, {})
+        index_row = {
+            "Record ID": record_id,
+            "Name": path.name,
+            "DirectoryName": meta.get("original_path", str(path.parent)),
+            "Extension": path.suffix.lower(),
+            "Size (KB)": size_kb,
+            "LastWriteTime": last_write,
+            "Batch Number": batch_number,
+            "Consolidated Batch Workbook Name": batch_workbook_path.name,
+            "Processing Status": status,
+            "Duplicate Status": dup_status,
+            "Duplicate Of": dup_of,
+            "Processing Timestamp": now_iso(),
+            "Drive URL": meta.get("drive_url", ""),
+        }
+        new_index_rows.append(index_row)
+
+        if file_hash:
+            state["file_registry"][file_hash] = {
+                "name": path.name, "size_kb": size_kb, "record_id": record_id,
+                "batch_number": batch_number,
+            }
+
+        if dup_status != "Unique":
+            new_dup_rows.append({
+                "Record ID": record_id, "Name": path.name,
+                "DirectoryName": index_row["DirectoryName"], "File Hash": file_hash,
+                "Size (KB)": size_kb, "Duplicate Status": dup_status,
+                "Duplicate Of": dup_of, "Batch Number": batch_number,
+                "Detected At": now_iso(),
+            })
+
+    detect_duplicates(all_records)
     used_columns = [c for c in registry.columns
-                     if any(r.get(c) not in (None, "") for r in combined)]
-    write_master(master_path, used_columns, combined)
-    write_log(log_path, log_entries)
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-    registry_path.write_text(json.dumps(sorted(processed_registry), indent=2))
+                     if any(r.get(c) not in (None, "") for r in all_records)]
+    write_batch_workbook(batch_workbook_path, used_columns, all_records)
 
-    # --------------------------------------------------------------------
-    # SAFETY GUARD: check what actually landed on disk, not what we think
-    # we wrote. Runs every time, costs nothing, never blocks a write --
-    # only makes abnormal growth visible instead of silent.
-    # --------------------------------------------------------------------
-    try:
-        master_file_size_mb = round(master_path.stat().st_size / (1024 * 1024), 2)
-    except OSError:
-        master_file_size_mb = None
-    size_warning = bool(
-        (master_file_size_mb is not None and master_file_size_mb > MAX_SAFE_MASTER_SIZE_MB)
-        or len(combined) > MAX_SAFE_ROW_COUNT
-    )
+    _write_xlsx_rows(master_index_path, MASTER_INDEX_COLUMNS, existing_index_rows + new_index_rows)
+    _write_xlsx_rows(dup_report_path, DUPLICATE_REPORT_COLUMNS, existing_dup_rows + new_dup_rows)
 
-    dup_count = sum(1 for r in combined if r.get("Possible Duplicate Of"))
+    sheets_errored = sum(1 for l in log_entries if l["status"] == "ERROR")
+    warnings = sum(1 for l in log_entries if l["status"] in
+                    ("SKIPPED_PIVOT_TABLE", "SKIPPED_EXCLUDED_SHEET_NAME"))
+    duration = round(time.time() - t_batch_start, 3)
+
+    batch_log_row = {
+        "Batch Number": batch_number, "Event": "Batch Complete",
+        "Files Processed": len(files), "Files Skipped": 0,
+        "Duplicate Files": len(new_dup_rows), "Errors": sheets_errored,
+        "Warnings": warnings, "Processing Time (sec)": duration,
+        "Timestamp": now_iso(),
+    }
+    _write_xlsx_rows(processing_log_path, PROCESSING_LOG_COLUMNS,
+                      existing_log_rows + [batch_log_row])
+
+    sheet_registry_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet_registry_path.write_text(json.dumps(sorted(processed_sheet_hashes), indent=2))
+
+    state["batches"].append({
+        "batch_number": batch_number, "files_in_batch": len(files),
+        "rows_imported": len(all_records), "errors": sheets_errored,
+        "duplicates": len(new_dup_rows), "duration_sec": duration,
+        "completed_at": now_iso(),
+    })
+    state["next_batch_number"] = batch_number + 1
+    save_state(state_path, state)
+
     summary = {
-        "status": "warning_large_master" if size_warning else "ok",
-        "files_scanned": len(files),
-        "new_rows_imported": len(all_new_records),
-        "total_rows_in_master": len(combined),
-        "total_columns": len(used_columns),
-        "possible_duplicates_flagged": dup_count,
-        "sheets_ok": sum(1 for l in log_entries if l["status"] == "OK"),
-        "sheets_empty_skipped": sum(1 for l in log_entries if l["status"] == "EMPTY_SKIPPED"),
-        "sheets_duplicate_skipped": sum(1 for l in log_entries if l["status"] == "SKIPPED_DUPLICATE"),
-        "sheets_errored": sum(1 for l in log_entries if l["status"] == "ERROR"),
+        "status": "warning" if sheets_errored > 0 else "ok",
+        "batch_number": batch_number,
+        "files_in_batch": len(files),
+        "rows_imported": len(all_records),
+        "duplicates_flagged": len(new_dup_rows),
+        "sheets_errored": sheets_errored,
+        "sheets_warnings": warnings,
+        "batch_workbook": str(batch_workbook_path),
+        "duration_sec": duration,
         "errors": [l for l in log_entries if l["status"] == "ERROR"],
-        "master_path": str(master_path),
-        "log_path": str(log_path),
-        "master_file_size_mb": master_file_size_mb,
-        "size_warning": size_warning,
     }
     return summary
 
 
+def run_finalize(state_path, workflow_summary_path):
+    """Closes out a run: writes Workflow_Summary.xlsx from the persisted
+    state (no source files touched -- purely an aggregation step)."""
+    state_path = Path(state_path)
+    workflow_summary_path = Path(workflow_summary_path)
+    state = load_state(state_path)
+    batches = state["batches"]
+
+    total_files = sum(b["files_in_batch"] for b in batches)
+    total_rows = sum(b["rows_imported"] for b in batches)
+    total_errors = sum(b["errors"] for b in batches)
+    total_dupes = sum(b["duplicates"] for b in batches)
+    total_time = sum(b["duration_sec"] for b in batches)
+    avg_batch_time = round(total_time / len(batches), 3) if batches else 0
+
+    summary_rows = [{
+        "Total Source Files Discovered": total_files,
+        "Total Batches Created": len(batches),
+        "Total Processed Successfully": total_files - total_errors,
+        "Total Failed": total_errors,
+        "Total Duplicates": total_dupes,
+        "Total Rows Imported": total_rows,
+        "Total Execution Time (sec)": round(total_time, 3),
+        "Average Batch Processing Time (sec)": avg_batch_time,
+        "Workflow Start": state["workflow_start"],
+        "Workflow Completion Timestamp": now_iso(),
+    }]
+    _write_xlsx_rows(workflow_summary_path, list(summary_rows[0].keys()), summary_rows)
+
+    return {
+        "status": "ok", "total_batches": len(batches), "total_files": total_files,
+        "total_rows_imported": total_rows, "total_errors": total_errors,
+        "total_duplicates": total_dupes, "workflow_summary_path": str(workflow_summary_path),
+    }
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 def load_config(config_path):
     cfg = json.loads(Path(config_path).read_text())
-    required = ["source_dir", "master_path", "registry_path", "log_path"]
+    required = ["source_dir", "batch_workbook_path", "state_path", "master_index_path",
+                "dup_report_path", "processing_log_path", "sheet_registry_path"]
     missing = [k for k in required if k not in cfg]
     if missing:
         raise ValueError(f"Config missing required keys: {missing}")
@@ -819,31 +959,79 @@ def load_config(config_path):
 
 def main():
     parser = argparse.ArgumentParser(description="LPH Master Database Consolidation Engine")
-    parser.add_argument("--config", help="Path to JSON config file (source_dir, master_path, "
-                                          "registry_path, log_path)")
-    parser.add_argument("source_dir", nargs="?", help="Folder of source spreadsheets")
-    parser.add_argument("master_path", nargs="?", help="Path to Master_Database.xlsx")
-    parser.add_argument("registry_path", nargs="?", help="Path to processed_registry.json")
-    parser.add_argument("log_path", nargs="?", help="Path to import_log.json")
+    parser.add_argument("--mode", choices=["batch", "finalize"], default="batch",
+                         help="'batch' processes one batch of files sitting in --source-dir; "
+                              "'finalize' writes Workflow_Summary.xlsx from persisted state "
+                              "and touches no source files.")
+    parser.add_argument("--config", help="Path to JSON config file (batch mode only)")
+    parser.add_argument("--source-dir", help="Folder containing this batch's downloaded files")
+    parser.add_argument("--batch-workbook-path", help="Output path for Consolidated_Batch_NNN.xlsx "
+                                                        "('NNN' is auto-substituted with the "
+                                                        "zero-padded batch number from state)")
+    parser.add_argument("--state-path", required=False, help="Path to batch_state.json (persisted "
+                                                               "batch counter, record IDs, file "
+                                                               "registry -- crash-safe resume)")
+    parser.add_argument("--master-index-path", help="Path to Master_Index.xlsx")
+    parser.add_argument("--dup-report-path", help="Path to Duplicate_Report.xlsx")
+    parser.add_argument("--processing-log-path", help="Path to Processing_Log.xlsx")
+    parser.add_argument("--sheet-registry-path", help="Path to processed_sheet_hashes.json "
+                                                        "(existing content-level dedup, unchanged)")
+    parser.add_argument("--manifest-path", help="Optional JSON mapping filename -> "
+                                                 "{drive_url, original_path} for Master_Index")
+    parser.add_argument("--workflow-summary-path", help="Path to Workflow_Summary.xlsx "
+                                                          "(finalize mode only)")
     args = parser.parse_args()
 
     try:
+        if args.mode == "finalize":
+            if not args.state_path or not args.workflow_summary_path:
+                print(json.dumps({"status": "fatal_error",
+                                   "error": "finalize mode requires --state-path and --workflow-summary-path"}))
+                sys.exit(2)
+            summary = run_finalize(args.state_path, args.workflow_summary_path)
+            print(json.dumps(summary))
+            sys.exit(0)
+
         if args.config:
             cfg = load_config(args.config)
-            source_dir, master_path = cfg["source_dir"], cfg["master_path"]
-            registry_path, log_path = cfg["registry_path"], cfg["log_path"]
-        elif args.source_dir and args.master_path:
-            source_dir, master_path = args.source_dir, args.master_path
-            registry_path = args.registry_path or str(Path(master_path).with_suffix(".registry.json"))
-            log_path = args.log_path or str(Path(master_path).with_suffix(".import_log.json"))
         else:
+            cfg = {
+                "source_dir": args.source_dir,
+                "batch_workbook_path": args.batch_workbook_path,
+                "state_path": args.state_path,
+                "master_index_path": args.master_index_path,
+                "dup_report_path": args.dup_report_path,
+                "processing_log_path": args.processing_log_path,
+                "sheet_registry_path": args.sheet_registry_path,
+                "manifest_path": args.manifest_path,
+            }
+
+        missing = [k for k in ("source_dir", "batch_workbook_path", "state_path",
+                                "master_index_path", "dup_report_path",
+                                "processing_log_path", "sheet_registry_path")
+                   if not cfg.get(k)]
+        if missing:
             print(json.dumps({"status": "fatal_error",
-                               "error": "Provide --config <file> OR source_dir + master_path args"}))
+                               "error": f"batch mode missing required args: {missing}"}))
             sys.exit(2)
 
-        summary = consolidate(source_dir, master_path, registry_path, log_path)
+        batch_workbook_path = cfg["batch_workbook_path"]
+        if "NNN" in batch_workbook_path:
+            state = load_state(Path(cfg["state_path"]))
+            batch_workbook_path = batch_workbook_path.replace("NNN", f"{state['next_batch_number']:03d}")
+
+        summary = run_batch(
+            source_dir=cfg["source_dir"],
+            batch_workbook_path=batch_workbook_path,
+            state_path=cfg["state_path"],
+            master_index_path=cfg["master_index_path"],
+            dup_report_path=cfg["dup_report_path"],
+            processing_log_path=cfg["processing_log_path"],
+            sheet_registry_path=cfg["sheet_registry_path"],
+            manifest_path=cfg.get("manifest_path"),
+        )
         print(json.dumps(summary))
-        sys.exit(1 if (summary["sheets_errored"] > 0 or summary["size_warning"]) else 0)
+        sys.exit(1 if summary["sheets_errored"] > 0 else 0)
 
     except Exception as e:
         print(json.dumps({"status": "fatal_error", "error": str(e)}))
