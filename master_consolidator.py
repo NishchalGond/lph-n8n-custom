@@ -151,7 +151,8 @@ SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".csv"}
 # column, since it's the stable key meant for merging/updating against in
 # future runs, not incidental bookkeeping like the others.
 META_COLUMNS = ["Record ID", "_source_file", "_source_sheet", "_source_row", "_ingested_at"]
-ENRICHMENT_COLUMNS = ["Mobile Number (Normalized)", "Email Valid", "Possible Duplicate Of"]
+ENRICHMENT_COLUMNS = ["Mobile Number (Normalized)", "Mobile Country", "Mobile Number Valid",
+                       "Email Valid", "Possible Duplicate Of"]
 
 # ----------------------------------------------------------------------------
 # SAFETY GUARD -- after writing the master file, its size and row count are
@@ -348,23 +349,57 @@ def infer_generic_headers(sample_rows, width):
 # ============================================================================
 # NON-DESTRUCTIVE ENRICHMENT (PLUGIN POINTS)
 # ============================================================================
-def normalize_uae_phone(raw):
-    if raw is None or str(raw).strip() == "":
-        return None
-    digits = re.sub(r"[^\d]", "", str(raw))
-    if not digits:
-        return None
-    if digits.startswith("00971"):
-        digits = digits[2:]
-    if digits.startswith("971"):
-        return "+" + digits
-    if digits.startswith("0"):
-        return "+971" + digits[1:]
-    if len(digits) == 9:
-        return "+971" + digits
-    if len(digits) >= 8:
-        return "+" + digits
-    return None
+import phonenumbers
+from phonenumbers import NumberParseException
+
+# Friendly names for the country codes phonenumbers detects, so the sheet
+# reads "Saudi Arabia" instead of a bare ISO code "SA". Not exhaustive --
+# any code not listed here just falls back to showing the ISO code itself,
+# which is still meaningful, just less pretty.
+COUNTRY_NAMES = {
+    "AE": "UAE", "SA": "Saudi Arabia", "IQ": "Iraq", "IR": "Iran",
+    "IN": "India", "PK": "Pakistan", "EG": "Egypt", "JO": "Jordan",
+    "LB": "Lebanon", "SY": "Syria", "KW": "Kuwait", "QA": "Qatar",
+    "BH": "Bahrain", "OM": "Oman", "YE": "Yemen", "GB": "UK",
+    "US": "USA", "CA": "Canada", "AU": "Australia", "FR": "France",
+    "DE": "Germany", "PH": "Philippines", "BD": "Bangladesh",
+    "NG": "Nigeria", "CN": "China", "RU": "Russia", "TR": "Turkey",
+    "ZA": "South Africa", "KE": "Kenya", "MA": "Morocco", "TN": "Tunisia",
+    "DZ": "Algeria", "LK": "Sri Lanka", "NP": "Nepal", "AF": "Afghanistan",
+    "SD": "Sudan", "ET": "Ethiopia", "MY": "Malaysia", "ID": "Indonesia",
+    "IT": "Italy", "ES": "Spain", "NL": "Netherlands", "CH": "Switzerland",
+}
+
+_GARBAGE_PHONE_VALUES = {"null", "n/a", "na", "none", "-", "0", "00", "nil"}
+
+
+def normalize_phone(raw, default_region="AE"):
+    """Best-effort international phone parsing for a NEW column -- never
+    touches the original value. default_region is only used as a fallback
+    guess for numbers with NO country code at all (bare local format); a
+    number that already carries a country code (leading + or 00) is parsed
+    using that, not assumed to be UAE. Returns (e164_or_None,
+    country_name_or_None, is_valid_bool_or_None)."""
+    if raw is None:
+        return None, None, None
+    s = str(raw).strip()
+    if not s or s.lower() in _GARBAGE_PHONE_VALUES:
+        return None, None, None
+    s = s.replace("|", "")  # source data sometimes has stray pipe separators, e.g. "971|55-2600133"
+    if s.startswith("00"):
+        s = "+" + s[2:]
+    try:
+        parsed = phonenumbers.parse(s, None if s.startswith("+") else default_region)
+    except NumberParseException:
+        return None, None, None
+    valid = phonenumbers.is_valid_number(parsed)
+    possible = phonenumbers.is_possible_number(parsed)
+    if not (valid or possible):
+        return None, None, None
+    e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+    region = phonenumbers.region_code_for_number(parsed)
+    country_name = COUNTRY_NAMES.get(region, region)
+    return e164, country_name, valid
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -378,12 +413,15 @@ def is_valid_email(raw):
 
 def enrich_record(rec):
     for slot in ("Mobile 1", "Mobile 2", "Mobile 3"):
-        mobile = rec.get(slot)
-        if mobile is not None:
-            norm = normalize_uae_phone(mobile)
-            if norm:
-                rec["Mobile Number (Normalized)"] = norm
-                break
+        raw = rec.get(slot)
+        if raw is None:
+            continue
+        e164, country_name, valid = normalize_phone(raw)
+        if e164:
+            rec["Mobile Number (Normalized)"] = e164
+            rec["Mobile Country"] = country_name
+            rec["Mobile Number Valid"] = valid
+            break  # first successfully-parsed slot wins for duplicate-detection purposes
     email = rec.get("Email Address")
     if email is not None:
         rec["Email Valid"] = is_valid_email(email)
