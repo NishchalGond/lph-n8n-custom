@@ -1,14 +1,47 @@
 #!/usr/bin/env python3
+"""
+master_consolidator.py
+
+Consolidates a folder of messy source spreadsheets (xlsx/xls/xlsm/csv) with
+inconsistent column headers into a single canonical-schema workbook.
+
+Improvements over the original version:
+  * Token-based header matching instead of naive substring matching, which
+    previously caused false positives (e.g. a header normalizing to "no"
+    could match almost any alias containing "no" as a substring).
+  * Scored conflict resolution: when multiple source columns map to the same
+    canonical field, the best match wins (based on match tier + distance)
+    instead of "whichever column appeared first in the sheet".
+  * Structured logging (via the `logging` module) instead of bare `print`
+    calls, so diagnostic output never contaminates the JSON result printed
+    on stdout.
+  * Type hints and docstrings throughout for maintainability.
+  * More detailed audit trail: unmapped columns now include *why* they were
+    unmapped (no match vs. lost a conflict vs. overflow phone column).
+
+Usage:
+    python master_consolidator.py <incoming_dir> <batch_output_path> <run_number> [--verbose]
+"""
+from __future__ import annotations
+
 import sys
 import os
 import re
 import json
 import glob
+import logging
 import difflib
+import argparse
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 
 CANONICAL_FIELDS = [
     "Name", "Community", "Sub-Community", "Building/Cluster", "Unit Number",
@@ -48,8 +81,21 @@ HEADER_SCAN_ROWS = 30
 LOOKAHEAD_ROWS = 4
 MIN_LOOKAHEAD_FILL_RATIO = 0.5
 
+# Match-quality tiers, used to resolve conflicts when two source columns
+# want to claim the same canonical field. Lower number = better match.
+TIER_EXACT = 0      # normalized header == alias, exactly
+TIER_TOKEN = 1       # token-set match (all words of the shorter phrase present)
+TIER_FUZZY = 2       # difflib close-match fallback
 
-def normalize(s):
+logger = logging.getLogger("master_consolidator")
+
+
+# --------------------------------------------------------------------------- #
+# Text normalization & alias index
+# --------------------------------------------------------------------------- #
+
+def normalize(s: Optional[str]) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
     if s is None:
         return ""
     s = str(s).strip().lower()
@@ -58,8 +104,8 @@ def normalize(s):
     return s
 
 
-ALIAS_LOOKUP = {}
-ALL_ALIASES = []
+ALIAS_LOOKUP: dict[str, str] = {}
+ALL_ALIASES: list[str] = []
 for canon, aliases in ALIASES.items():
     for a in aliases:
         na = normalize(a)
@@ -67,35 +113,89 @@ for canon, aliases in ALIASES.items():
         ALL_ALIASES.append(na)
 
 
-def is_phone_header(norm_header):
-    return any(p in norm_header for p in PHONE_PATTERNS)
+def is_phone_header(norm_header: str) -> bool:
+    tokens = set(norm_header.split())
+    return any(
+        p in norm_header if " " in p else p in tokens
+        for p in PHONE_PATTERNS
+    )
 
 
-def map_header(raw_header):
+@dataclass
+class HeaderMatch:
+    canonical: Optional[str]   # canonical field name, or "PHONE", or None
+    tier: int = 99             # lower is better
+    distance: float = 1.0      # 0 = perfect, used to break ties within a tier
+
+
+def _token_match(norm: str, alias: str) -> bool:
+    """
+    True if `alias`'s words are a subset of `norm`'s words (or vice versa),
+    which is a much safer notion of "contains" than raw substring matching.
+    This is what previously caused false positives like a header
+    normalizing to 'no' matching almost any alias containing 'no'.
+    """
+    norm_tokens = set(norm.split())
+    alias_tokens = set(alias.split())
+    if not norm_tokens or not alias_tokens:
+        return False
+    return alias_tokens.issubset(norm_tokens) or norm_tokens.issubset(alias_tokens)
+
+
+def map_header(raw_header: str) -> HeaderMatch:
+    """
+    Map a raw source header to a canonical field (or the sentinel "PHONE"
+    for any phone-like column, resolved to Mobile 1/2/3 slots later).
+
+    Matching proceeds in tiers, best first:
+      1. Exact normalized match against a known alias.
+      2. Token-set match (safer than substring matching).
+      3. Fuzzy match via difflib, as a last resort.
+    """
     norm = normalize(raw_header)
     if not norm:
-        return None
+        return HeaderMatch(None)
+
     if is_phone_header(norm):
-        return "PHONE"
+        return HeaderMatch("PHONE", tier=TIER_EXACT, distance=0.0)
+
     if norm in ALIAS_LOOKUP:
-        return ALIAS_LOOKUP[norm]
+        return HeaderMatch(ALIAS_LOOKUP[norm], tier=TIER_EXACT, distance=0.0)
+
+    best: Optional[HeaderMatch] = None
     for alias, canon in ALIAS_LOOKUP.items():
-        if alias in norm or norm in alias:
-            return canon
+        if _token_match(norm, alias):
+            # Prefer the alias closest in length to the header (fewer
+            # "extra" words = a tighter, more confident match).
+            distance = abs(len(norm) - len(alias)) / max(len(norm), len(alias), 1)
+            candidate = HeaderMatch(canon, tier=TIER_TOKEN, distance=distance)
+            if best is None or candidate.distance < best.distance:
+                best = candidate
+    if best is not None:
+        return best
+
     close = difflib.get_close_matches(norm, ALL_ALIASES, n=1, cutoff=FUZZY_CUTOFF)
     if close:
-        return ALIAS_LOOKUP[close[0]]
-    return None
+        ratio = difflib.SequenceMatcher(None, norm, close[0]).ratio()
+        return HeaderMatch(ALIAS_LOOKUP[close[0]], tier=TIER_FUZZY, distance=1.0 - ratio)
+
+    return HeaderMatch(None)
 
 
-def _row_score(row):
-    return sum(1 for cell in row if map_header(cell))
+# --------------------------------------------------------------------------- #
+# Header-row detection
+# --------------------------------------------------------------------------- #
+
+def _row_score(row) -> int:
+    return sum(1 for cell in row if map_header(cell).canonical)
 
 
-def _looks_like_data(row, header_score):
-    """A row below the candidate header should be mostly filled in, and it
+def _looks_like_data(row, header_score: int) -> bool:
+    """
+    A row below the candidate header should be mostly filled in, and it
     should NOT itself look like another label/summary row (i.e. it
-    shouldn't match aliases almost as often as the header did)."""
+    shouldn't match aliases almost as often as the header did).
+    """
     non_empty = sum(1 for v in row if str(v).strip() != "")
     if non_empty == 0:
         return False
@@ -105,8 +205,10 @@ def _looks_like_data(row, header_score):
     return fill_ratio >= MIN_LOOKAHEAD_FILL_RATIO
 
 
-def find_header_row(raw_df):
-    """Scan the first HEADER_SCAN_ROWS rows for the best header candidate.
+def find_header_row(raw_df: pd.DataFrame) -> tuple[int, int]:
+    """
+    Scan the first HEADER_SCAN_ROWS rows for the best header candidate.
+
     A candidate only "qualifies" if the rows immediately beneath it look
     like real tabular data rather than more summary/label text -- this
     stops title-block / summary-section rows (e.g. "Unique Developers:")
@@ -115,6 +217,9 @@ def find_header_row(raw_df):
     qualifying (or, failing that, all) candidates we prefer more good
     data rows beneath them, then higher score, then the LATER row on ties
     -- summary blocks tend to sit above the real table, not below it.
+
+    Returns (header_row_index, score). If no candidate scores above zero,
+    returns (0, 0) so the caller can raise a clear error.
     """
     n = min(HEADER_SCAN_ROWS, len(raw_df))
     candidates = []
@@ -139,10 +244,19 @@ def find_header_row(raw_df):
             best_row = i
             best_score = score
 
+    logger.debug(
+        "header row candidates=%s -> chosen row=%d score=%d",
+        candidates, best_row, best_score,
+    )
     return best_row, best_score
 
 
-def read_source_file(path):
+# --------------------------------------------------------------------------- #
+# File reading
+# --------------------------------------------------------------------------- #
+
+def read_source_file(path: str) -> pd.DataFrame:
+    """Load a source file and slice it down to header row + data rows."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         raw = pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
@@ -164,75 +278,154 @@ def read_source_file(path):
     return data
 
 
-def map_file_to_canonical(df, filename):
-    phone_cols_in_order = []
-    canon_col_for = {}
-    unmapped = []
+# --------------------------------------------------------------------------- #
+# Canonical mapping
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class MappingResult:
+    frame: pd.DataFrame
+    unmapped: list[dict] = field(default_factory=list)  # [{"column": ..., "reason": ...}]
+
+
+def map_file_to_canonical(df: pd.DataFrame, filename: str) -> MappingResult:
+    """
+    Map a source dataframe's columns onto CANONICAL_FIELDS.
+
+    Conflict handling: if multiple columns match the same canonical field,
+    the best-scoring match (by tier, then distance) wins; the rest are
+    recorded as unmapped with an explicit "lost to a better match" reason
+    rather than being silently dropped.
+    """
+    phone_cols_in_order: list[str] = []
+    # canon -> (column_name, HeaderMatch) for the current best claimant
+    best_for: dict[str, tuple[str, HeaderMatch]] = {}
+    unmapped: list[dict] = []
 
     for col in df.columns:
-        result = map_header(col)
-        if result is None:
-            if str(col).strip() != "":
-                unmapped.append(str(col))
+        col_str = str(col).strip()
+        match = map_header(col)
+
+        if match.canonical is None:
+            if col_str != "":
+                unmapped.append({"column": col_str, "reason": "no alias match found"})
             continue
-        if result == "PHONE":
+
+        if match.canonical == "PHONE":
             phone_cols_in_order.append(col)
+            continue
+
+        canon = match.canonical
+        if canon not in best_for:
+            best_for[canon] = (col, match)
         else:
-            if result not in canon_col_for:
-                canon_col_for[result] = col
+            existing_col, existing_match = best_for[canon]
+            if (match.tier, match.distance) < (existing_match.tier, existing_match.distance):
+                # New column is a stronger match; the old one loses.
+                unmapped.append({
+                    "column": str(existing_col).strip(),
+                    "reason": f"lost to a stronger match for '{canon}' ({col_str})",
+                })
+                best_for[canon] = (col, match)
             else:
-                unmapped.append(str(col))
+                unmapped.append({
+                    "column": col_str,
+                    "reason": f"'{canon}' already claimed by a stronger match ({existing_col})",
+                })
+
+    canon_col_for = {canon: col for canon, (col, _match) in best_for.items()}
 
     mobile_slots = ["Mobile 1", "Mobile 2", "Mobile 3"]
     for i, col in enumerate(phone_cols_in_order):
         if i < 3:
             canon_col_for[mobile_slots[i]] = col
         else:
-            unmapped.append(str(col))
+            unmapped.append({
+                "column": str(col).strip(),
+                "reason": "more than 3 phone-like columns found; only first 3 kept",
+            })
 
     out = pd.DataFrame()
-    for field in CANONICAL_FIELDS:
-        if field in canon_col_for:
-            out[field] = df[canon_col_for[field]].astype(str).str.strip()
+    for field_name in CANONICAL_FIELDS:
+        if field_name in canon_col_for:
+            out[field_name] = df[canon_col_for[field_name]].astype(str).str.strip()
         else:
-            out[field] = ""
+            out[field_name] = ""
 
     out = out[~(out.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
-    return out, unmapped
+    logger.debug("%s: mapped columns=%s unmapped=%s", filename, canon_col_for, unmapped)
+    return MappingResult(frame=out, unmapped=unmapped)
 
 
-def diagnose_folder(incoming_dir):
-    """Utility: report which header row each source file resolved to and
+# --------------------------------------------------------------------------- #
+# Diagnostics helper (unchanged behavior, now uses logging)
+# --------------------------------------------------------------------------- #
+
+def diagnose_folder(incoming_dir: str) -> None:
+    """
+    Utility: report which header row each source file resolved to and
     how many data rows it yielded, without writing an output file. Handy
-    for spot-checking a batch after changing header detection."""
-    import glob as _glob
-    for p in sorted(_glob.glob(f"{incoming_dir}/*.xlsx") + _glob.glob(f"{incoming_dir}/*.xls") + _glob.glob(f"{incoming_dir}/*.csv")):
+    for spot-checking a batch after changing header detection.
+    """
+    for p in sorted(
+        glob.glob(f"{incoming_dir}/*.xlsx")
+        + glob.glob(f"{incoming_dir}/*.xls")
+        + glob.glob(f"{incoming_dir}/*.csv")
+    ):
         try:
             df = read_source_file(p)
-            out, unmapped = map_file_to_canonical(df, p)
-            print(f"{os.path.basename(p):40s} headers={list(df.columns)[:5]}... rows={len(out)} unmapped={len(unmapped)}")
+            result = map_file_to_canonical(df, p)
+            logger.info(
+                "%-40s headers=%s... rows=%d unmapped=%d",
+                os.path.basename(p), list(df.columns)[:5], len(result.frame), len(result.unmapped),
+            )
         except Exception as e:
-            print(f"{os.path.basename(p):40s} FAILED: {e}")
+            logger.warning("%-40s FAILED: %s", os.path.basename(p), e)
 
 
-def main():
+# --------------------------------------------------------------------------- #
+# Main entry point
+# --------------------------------------------------------------------------- #
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Consolidate messy source spreadsheets into a single canonical-schema workbook."
+    )
+    parser.add_argument("incoming_dir", help="folder containing source .xlsx/.xls/.xlsm/.csv files")
+    parser.add_argument("batch_output_path", help="path to write the consolidated .xlsx output")
+    parser.add_argument("run_number", help="identifier for this run, used in the audit log filename")
+    parser.add_argument("-v", "--verbose", action="store_true", help="enable debug logging to stderr")
+    return parser
+
+
+def main() -> None:
+    # Preserve the original positional-args contract for backward compatibility,
+    # while adding an optional --verbose flag.
     if len(sys.argv) < 4:
         print(json.dumps({
             "status": "fatal_error",
-            "error": "usage: master_consolidator.py <incoming_dir> <batch_output_path> <run_number>",
+            "error": "usage: master_consolidator.py <incoming_dir> <batch_output_path> <run_number> [--verbose]",
         }))
         sys.exit(1)
 
-    incoming_dir = sys.argv[1]
-    batch_output_path = sys.argv[2]
-    run_number = sys.argv[3]
+    args = build_arg_parser().parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
+    incoming_dir = args.incoming_dir
+    batch_output_path = args.batch_output_path
+    run_number = args.run_number
 
     try:
         if not os.path.isdir(incoming_dir):
             raise FileNotFoundError(f"incoming_dir not found: {incoming_dir}")
 
         patterns = ["*.xlsx", "*.xls", "*.xlsm", "*.csv"]
-        files = []
+        files: list[str] = []
         for p in patterns:
             files.extend(glob.glob(os.path.join(incoming_dir, p)))
         files = sorted(set(files))
@@ -240,28 +433,27 @@ def main():
         if not files:
             raise FileNotFoundError(f"no source files found in {incoming_dir}")
 
-        frames = []
-        failed_files = []
-        unmapped_columns = {}
+        frames: list[pd.DataFrame] = []
+        failed_files: list[dict] = []
+        unmapped_columns: dict[str, list[dict]] = {}
         files_succeeded = 0
 
         for path in files:
             fname = os.path.basename(path)
             try:
                 raw_df = read_source_file(path)
-                canon_df, unmapped = map_file_to_canonical(raw_df, fname)
-                if unmapped:
-                    unmapped_columns[fname] = unmapped
-                frames.append(canon_df)
+                result = map_file_to_canonical(raw_df, fname)
+                if result.unmapped:
+                    unmapped_columns[fname] = result.unmapped
+                frames.append(result.frame)
                 files_succeeded += 1
+                logger.info("%s: OK, %d rows", fname, len(result.frame))
             except Exception as e:
                 failed_files.append({"file": fname, "error": str(e)})
+                logger.warning("%s: FAILED (%s)", fname, e)
                 continue
 
-        if frames:
-            combined = pd.concat(frames, ignore_index=True)
-        else:
-            combined = pd.DataFrame(columns=CANONICAL_FIELDS)
+        combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CANONICAL_FIELDS)
 
         os.makedirs(os.path.dirname(os.path.abspath(batch_output_path)), exist_ok=True)
         combined.to_excel(batch_output_path, index=False, columns=CANONICAL_FIELDS)
@@ -279,7 +471,7 @@ def main():
         abs_output = os.path.abspath(batch_output_path)
         stat = os.stat(abs_output)
 
-        result = {
+        result_payload = {
             "status": status,
             "run_number": run_number,
             "batch_output_file": abs_output,
@@ -302,11 +494,11 @@ def main():
             os.makedirs(audit_dir, exist_ok=True)
             audit_path = os.path.join(audit_dir, f"batch_{run_number}_detail.json")
             with open(audit_path, "w") as f:
-                json.dump(result, f, indent=2)
+                json.dump(result_payload, f, indent=2)
         except Exception:
-            pass
+            logger.warning("could not write audit log", exc_info=True)
 
-        print(json.dumps(result))
+        print(json.dumps(result_payload))
         sys.exit(0)
 
     except Exception as e:
