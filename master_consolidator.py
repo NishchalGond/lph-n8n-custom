@@ -59,40 +59,77 @@ HEADER_SYNONYMS = {
              "customer name", "name of owner", "client", "full name",
              "first name", "client full name", "primary applicant name",
              "nameen", "joint acct name", "account name"],
-    "Unit Number": ["unit", "unit no", "unit number", "villa number", "villa no",
-                     "property number", "property no", "land number", "land no",
-                     "plot number", "plot no", "no of unit", "no of units", "unit id",
-                     "unitnumber", "flat number", "flat", "unit name"],
-    "Mobile Number": ["phone", "mobile", "number", "contact number", "phone number",
-                        "contact no", "contact", "mobile no", "mobile number",
-                        "tel", "telephone", "phone no", "primary phone",
-                        "phone mobile", "mobile 1", "primary mobile number",
-                        "poa mobile no."],
-    "Alternate Number(s)": ["secondary mobile", "secondary phone", "alternate number",
-                              "alt number", "alternative number", "second contact",
-                              "other number", "mobile 2", "poa phone no.",
-                              "mobile no.3", "mobile phone3", "mobile 3",
-                              "phone 2", "phone no.3"],
-    "Telephone Number": ["telephone number", "telephone residence", "telephone office",
-                          "phone 1", "general"],
-    "Email Address": ["email", "e-mail", "email address", "e mail", "email add"],
-    "Community": ["community", "community name", "master location", "sub community"],
-    "Developer": ["developer", "project developer"],
-    "Building / Tower": ["building", "tower", "building name", "building 1",
+    "Community": ["community", "community name", "master location"],
+    "Sub-Community": ["sub community", "subcommunity", "sub-community"],
+    "Building/Cluster": ["building", "tower", "building name", "building 1",
                           "buildingname 2", "buildingnameen", "tower name",
-                          "bldg.", "bldg. no."],
+                          "bldg.", "bldg. no.", "cluster", "building/cluster",
+                          "building cluster"],
+    "Unit Number": ["unit", "unit no", "unit number", "villa number", "villa no",
+                     "property number", "property no", "no of unit", "no of units",
+                     "unit id", "unitnumber", "flat number", "flat", "unit name"],
+    "Size": ["size", "actual size", "unit size", "area", "actual area"],
+    "Plot Reg. No": ["plot reg no", "plot reg. no", "plot registration number",
+                       "reg no", "registration number", "regis"],
+    "Plot Number": ["plot number", "plot no", "land number", "land no", "landnumber", "plotno"],
+    "DMNO": ["dm no", "dmno", "municipality number", "municipality no"],
+    "DMsubno": ["dm sub no", "dmsubno", "municipality sub no", "municipality subno",
+                 "dm sub number"],
+    "Bedroom": ["bhk", "no bhk", "bedrooms", "bedroom", "no of bedrooms", "bed", "beds",
+                 "rooms", "rooms description"],
+    "Type (Buyer/Seller)": ["type buyer seller", "buyer seller", "buyer/seller",
+                              "type (buyer/seller)", "transaction type", "party type"],
+    "Email Address": ["email", "e-mail", "email address", "e mail", "email add"],
+    "PI number": ["pi number", "pi no", "pino", "pi num"],
+    "Nationality": ["nationality", "nation"],
+    "Property Type": ["property type", "unit type", "sub type", "flat typology"],
+    "Date": ["date", "transaction date", "procedure date", "date of transaction"],
+    "Procedure Value": ["procedure value", "procedurevalue", "transaction amount",
+                          "transaction value", "amount"],
+    "Developer": ["developer", "project developer"],
     "Project": ["project", "project name", "master project", "emaar project",
                 "master project land", "project lnd", "sub project"],
-    "Phase": ["phase", "project phase"],
-    "Bedrooms": ["bhk", "no bhk", "bedrooms", "no of bedrooms", "bed", "beds",
-                 "rooms", "rooms description", "flat typology"],
+    # Kept for zero-data-loss, but not part of the required main list -- these
+    # still consolidate their own synonyms into one column each, just ordered
+    # after the main headers instead of before them.
     "Serial No": ["serial no", "serial number", "sno", "sr no"],
-    "Nationality": ["nationality", "nation"],
     "Emirates ID Number": ["idnumber", "uaeidnumber", "emirates id number"],
     "Passport Number": ["passport"],
     "Date of Birth": ["birthdate", "dob"],
     "Gender": ["gender"],
 }
+
+# The fixed, required column order for the consolidated output. These
+# ALWAYS appear in this exact order, even if a given run's data happens
+# not to populate one of them yet (unlike other auto-discovered columns,
+# which only appear when at least one row actually has a value).
+MAIN_HEADERS = [
+    "Name", "Community", "Sub-Community", "Building/Cluster", "Unit Number",
+    "Size", "Plot Reg. No", "Plot Number", "DMNO", "DMsubno", "Bedroom",
+    "Type (Buyer/Seller)", "Mobile 1", "Mobile 2", "Mobile 3",
+    "Email Address", "PI number", "Nationality", "Property Type", "Date",
+    "Procedure Value", "Developer", "Project",
+]
+
+# Phone-like raw headers are handled separately from the normal
+# canonical_for() mapping: instead of every synonym collapsing onto one
+# fixed target column, each row's phone-like values are collected in the
+# order their columns appear and distributed across Mobile 1 / Mobile 2 /
+# Mobile 3 (a 4th+ distinct number gets appended onto Mobile 3 rather than
+# lost). This list is every synonym that means "this column is *a* phone
+# number", not any specific one of the three slots. Normalized into a set
+# further down, once normalize_header() exists.
+PHONE_SYNONYMS_RAW = [
+    "phone", "mobile", "number", "contact number", "phone number",
+    "contact no", "contact", "mobile no", "mobile number", "tel",
+    "telephone", "phone no", "primary phone", "phone mobile", "mobile 1",
+    "primary mobile number", "poa mobile no.", "secondary mobile",
+    "secondary phone", "alternate number", "alt number",
+    "alternative number", "second contact", "other number", "mobile 2",
+    "poa phone no.", "mobile no.3", "mobile phone3", "mobile 3", "phone 2",
+    "phone no.3", "telephone number", "telephone residence",
+    "telephone office", "phone 1", "general",
+]
 
 # NOTE ON THIS LIST: this is a starting expansion based on one real production
 # dataset, not an exhaustive mapping. Columns that still show up as sparse,
@@ -150,6 +187,9 @@ def normalize_header(raw):
     return s
 
 
+PHONE_SYNONYMS_NORMALIZED = {normalize_header(s) for s in PHONE_SYNONYMS_RAW}
+
+
 class SchemaRegistry:
     """Tracks the growing canonical column list and the mapping from every
     raw header seen so far -> canonical column. New, never-seen headers
@@ -160,10 +200,12 @@ class SchemaRegistry:
         self._norm_to_canonical = {}
         for canon, synonyms in HEADER_SYNONYMS.items():
             for syn in synonyms:
-                self._norm_to_canonical[syn] = canon
+                self._norm_to_canonical[normalize_header(syn)] = canon
             self._norm_to_canonical[normalize_header(canon)] = canon
         for col in self.columns:
             self._norm_to_canonical.setdefault(normalize_header(col), col)
+        for main_header in MAIN_HEADERS:
+            self.ensure_column(main_header)
 
     def canonical_for(self, raw_header):
         nk = normalize_header(raw_header)
@@ -287,7 +329,7 @@ def infer_generic_headers(sample_rows, width):
         if email_like / n > 0.6:
             headers[col] = "Email Address"
         elif digit_like / n > 0.6:
-            headers[col] = "Mobile Number"
+            headers[col] = "Mobile 1"
         elif bedroom_like / n > 0.6:
             headers[col] = "Bedrooms"
         elif community_like / n > 0.6:
@@ -335,11 +377,13 @@ def is_valid_email(raw):
 
 
 def enrich_record(rec):
-    mobile = rec.get("Mobile Number")
-    if mobile is not None:
-        norm = normalize_uae_phone(mobile)
-        if norm:
-            rec["Mobile Number (Normalized)"] = norm
+    for slot in ("Mobile 1", "Mobile 2", "Mobile 3"):
+        mobile = rec.get(slot)
+        if mobile is not None:
+            norm = normalize_uae_phone(mobile)
+            if norm:
+                rec["Mobile Number (Normalized)"] = norm
+                break
     email = rec.get("Email Address")
     if email is not None:
         rec["Email Valid"] = is_valid_email(email)
@@ -466,20 +510,30 @@ def read_workbook(path, registry, log_entries, processed_registry):
             header, data = result
 
             new_cols_before = set(registry.columns)
-            col_map = [registry.canonical_for(h) for h in header]
+            col_map = []
+            for h in header:
+                if normalize_header(h) in PHONE_SYNONYMS_NORMALIZED:
+                    col_map.append("__PHONE__")
+                else:
+                    col_map.append(registry.canonical_for(h))
 
             PHONE_LIKE_CANONICALS = {"Telephone Number", "Alternate Number(s)"}
 
             imported = 0
             for i, row in enumerate(data, start=1):
                 rec = {}
+                phone_vals = []  # collected in column order, deduped, assigned to Mobile 1/2/3 after the loop
                 for h_idx, canon in enumerate(col_map):
-                    if canon is None:
-                        continue
                     val = row[h_idx] if h_idx < len(row) else None
                     if val is None or str(val).strip() == "":
                         continue
                     val_str = str(val).strip()
+                    if canon == "__PHONE__":
+                        if val_str not in phone_vals:
+                            phone_vals.append(val_str)
+                        continue
+                    if canon is None:
+                        continue
                     if canon in rec and str(rec[canon]).strip() != val_str:
                         if canon in PHONE_LIKE_CANONICALS:
                             existing_parts = [p.strip() for p in str(rec[canon]).split(" / ")]
@@ -495,6 +549,14 @@ def read_workbook(path, registry, log_entries, processed_registry):
                             registry.ensure_column(alt)
                     else:
                         rec[canon] = val
+                if phone_vals:
+                    if len(phone_vals) >= 1:
+                        rec["Mobile 1"] = phone_vals[0]
+                    if len(phone_vals) >= 2:
+                        rec["Mobile 2"] = phone_vals[1]
+                    if len(phone_vals) >= 3:
+                        # a 4th+ distinct number is appended onto Mobile 3 rather than dropped
+                        rec["Mobile 3"] = " / ".join(phone_vals[2:])
                 if not rec:
                     continue
                 enrich_record(rec)
@@ -587,8 +649,10 @@ def _group_key_for(rec):
 
 
 def write_master(path, columns, records, group_sheets=True):
-    rest_meta = [c for c in META_COLUMNS + ENRICHMENT_COLUMNS if c not in columns and c != "Record ID"]
-    ordered_cols = ["Record ID"] + columns + rest_meta
+    extra_cols = [c for c in columns if c not in MAIN_HEADERS]
+    rest_meta = [c for c in META_COLUMNS + ENRICHMENT_COLUMNS
+                 if c not in MAIN_HEADERS and c not in extra_cols and c != "Record ID"]
+    ordered_cols = ["Record ID"] + MAIN_HEADERS + extra_cols + rest_meta
     wb = openpyxl.Workbook(write_only=True)
 
     ws = wb.create_sheet("Master")
