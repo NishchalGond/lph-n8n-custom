@@ -1,53 +1,4 @@
 #!/usr/bin/env python3
-"""
-master_consolidator.py
-
-Consolidates ONE BATCH of source Excel/CSV files (heterogeneous headers,
-one property-listing sheet per file) into a single output workbook that
-contains ONLY these 22 canonical columns, in this order:
-
-    Name, Community, Sub-Community, Building/Cluster, Unit Number, Size,
-    Plot Reg. No, Plot Number, DMNO, DMsubno, Bedroom, Type (Buyer/Seller),
-    Mobile 1, Mobile 2, Mobile 3, Email Address, PI number, Nationality,
-    Property Type, Date, Procedure Value, Developer, Project
-
-Design notes (why it's built this way):
-- Source files do NOT share one schema. Headers vary in name, order, and
-  which row they sit on. So every file gets its own header detection +
-  column-mapping pass rather than a fixed column-position copy.
-- Per-file failures are caught and skipped; they do not stop the batch.
-  Only an error outside the per-file loop (bad incoming dir, cannot write
-  output, etc.) is treated as fatal (exit code 1) -- matching the n8n
-  workflow's "Run Was Fatal?" check on exitCode == 1.
-- Phone-like columns are handled specially: a file may have multiple
-  DIFFERENT phone numbers under different headers (Mobile, Phone 2,
-  Contact No, Tel...). These are assigned in the order they appear in the
-  sheet to Mobile 1 / Mobile 2 / Mobile 3. Anything beyond 3 is dropped
-  and reported in unmapped_columns so nothing is silently lost without a
-  trace.
-- Columns the alias table can't confidently match are SKIPPED (not
-  guessed), and listed per-file in unmapped_columns in the JSON summary,
-  so you can see exactly what didn't make it into the batch sheet.
-
-Usage:
-    python3 master_consolidator.py <incoming_dir> <batch_output_path> <run_number>
-
-Prints exactly one JSON object to stdout (last line) for n8n to parse:
-{
-  "status": "success" | "partial" | "failed" | "fatal_error",
-  "run_number": "001",
-  "batch_output_file": "/abs/path/Consolidated_Batch_001.xlsx",
-  "files_total": 60,
-  "files_succeeded": 58,
-  "files_failed": 2,
-  "row_count": 12345,
-  "failed_files": [{"file": "...", "error": "..."}],
-  "unmapped_columns": {"some_file.xlsx": ["Weird Header 1", "..."]}
-}
-Exit code 0 for success/partial/failed (per-file issues never halt the run).
-Exit code 1 only for a fatal/system-level error.
-"""
-
 import sys
 import os
 import re
@@ -67,9 +18,6 @@ CANONICAL_FIELDS = [
     "Procedure Value", "Developer", "Project",
 ]
 
-# Canonical field -> list of normalized alias strings/patterns that should
-# map to it. Matching is done on a normalized header (lowercased, stripped,
-# punctuation collapsed to single spaces).
 ALIASES = {
     "Name":                 ["name", "full name", "owner name", "contact name", "client name", "customer name"],
     "Community":            ["community", "community name"],
@@ -93,12 +41,12 @@ ALIASES = {
     "Project":              ["project", "project name"],
 }
 
-# Header patterns that indicate a phone-number-like column. These are
-# collected in sheet order and distributed across Mobile 1/2/3.
 PHONE_PATTERNS = ["mobile", "phone", "contact no", "contact number", "tel", "telephone", "cell"]
 
 FUZZY_CUTOFF = 0.78
-HEADER_SCAN_ROWS = 10  # how many top rows to scan when guessing the header row
+HEADER_SCAN_ROWS = 30
+LOOKAHEAD_ROWS = 4
+MIN_LOOKAHEAD_FILL_RATIO = 0.5
 
 
 def normalize(s):
@@ -110,8 +58,6 @@ def normalize(s):
     return s
 
 
-# Build a flat lookup: normalized alias -> canonical field, plus a list of
-# all normalized aliases for fuzzy matching.
 ALIAS_LOOKUP = {}
 ALL_ALIASES = []
 for canon, aliases in ALIASES.items():
@@ -126,7 +72,6 @@ def is_phone_header(norm_header):
 
 
 def map_header(raw_header):
-    """Return ('phone', None) | (canonical_field, None) | (None, None)."""
     norm = normalize(raw_header)
     if not norm:
         return None
@@ -134,41 +79,70 @@ def map_header(raw_header):
         return "PHONE"
     if norm in ALIAS_LOOKUP:
         return ALIAS_LOOKUP[norm]
-    # substring match (e.g. "unit number (sqft)" contains "unit number")
     for alias, canon in ALIAS_LOOKUP.items():
         if alias in norm or norm in alias:
             return canon
-    # fuzzy fallback
     close = difflib.get_close_matches(norm, ALL_ALIASES, n=1, cutoff=FUZZY_CUTOFF)
     if close:
         return ALIAS_LOOKUP[close[0]]
     return None
 
 
+def _row_score(row):
+    return sum(1 for cell in row if map_header(cell))
+
+
+def _looks_like_data(row, header_score):
+    """A row below the candidate header should be mostly filled in, and it
+    should NOT itself look like another label/summary row (i.e. it
+    shouldn't match aliases almost as often as the header did)."""
+    non_empty = sum(1 for v in row if str(v).strip() != "")
+    if non_empty == 0:
+        return False
+    fill_ratio = non_empty / max(len(row), 1)
+    if header_score > 0 and _row_score(row) >= header_score * 0.6:
+        return False
+    return fill_ratio >= MIN_LOOKAHEAD_FILL_RATIO
+
+
 def find_header_row(raw_df):
-    """Scan the first HEADER_SCAN_ROWS rows and pick the one whose cells
-    match the most known aliases (canonical or phone). Falls back to row 0.
+    """Scan the first HEADER_SCAN_ROWS rows for the best header candidate.
+    A candidate only "qualifies" if the rows immediately beneath it look
+    like real tabular data rather than more summary/label text -- this
+    stops title-block / summary-section rows (e.g. "Unique Developers:")
+    from being mistaken for the real header when they score similarly on
+    alias matches. Qualifying candidates are preferred outright; among
+    qualifying (or, failing that, all) candidates we prefer more good
+    data rows beneath them, then higher score, then the LATER row on ties
+    -- summary blocks tend to sit above the real table, not below it.
     """
-    best_row = 0
-    best_score = -1
     n = min(HEADER_SCAN_ROWS, len(raw_df))
+    candidates = []
     for i in range(n):
-        row = raw_df.iloc[i]
-        score = 0
-        for cell in row:
-            m = map_header(cell)
-            if m:
-                score += 1
-        if score > best_score:
-            best_score = score
+        score = _row_score(raw_df.iloc[i])
+        if score > 0:
+            candidates.append((i, score))
+
+    if not candidates:
+        return 0, 0
+
+    best_key = None
+    best_row = candidates[0][0]
+    best_score = candidates[0][1]
+    for i, score in candidates:
+        lookahead = raw_df.iloc[i + 1:i + 1 + LOOKAHEAD_ROWS]
+        good_rows = sum(1 for _, r in lookahead.iterrows() if _looks_like_data(r, score))
+        qualifies = len(lookahead) > 0 and good_rows >= min(2, len(lookahead))
+        key = (qualifies, good_rows, score, i)
+        if best_key is None or key > best_key:
+            best_key = key
             best_row = i
+            best_score = score
+
     return best_row, best_score
 
 
 def read_source_file(path):
-    """Load a source file's data with the header row auto-detected.
-    Returns a DataFrame with the file's ORIGINAL headers as columns.
-    """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         raw = pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
@@ -186,17 +160,13 @@ def read_source_file(path):
     headers = raw.iloc[header_row].tolist()
     data = raw.iloc[header_row + 1:].reset_index(drop=True)
     data.columns = [str(h) if h is not None else "" for h in headers]
-    # drop fully blank rows
     data = data[~(data.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
     return data
 
 
 def map_file_to_canonical(df, filename):
-    """Map a source DataFrame (original headers) onto the 22 canonical
-    columns. Returns (canonical_df, unmapped_headers list).
-    """
     phone_cols_in_order = []
-    canon_col_for = {}   # canonical field -> original column name (first match wins)
+    canon_col_for = {}
     unmapped = []
 
     for col in df.columns:
@@ -211,11 +181,8 @@ def map_file_to_canonical(df, filename):
             if result not in canon_col_for:
                 canon_col_for[result] = col
             else:
-                # duplicate mapping to same canonical field -- keep first,
-                # flag the rest as unmapped so nothing is silently dropped
                 unmapped.append(str(col))
 
-    # distribute phone columns across Mobile 1/2/3 in sheet order
     mobile_slots = ["Mobile 1", "Mobile 2", "Mobile 3"]
     for i, col in enumerate(phone_cols_in_order):
         if i < 3:
@@ -230,9 +197,22 @@ def map_file_to_canonical(df, filename):
         else:
             out[field] = ""
 
-    # drop rows that are entirely empty across all canonical fields
     out = out[~(out.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
     return out, unmapped
+
+
+def diagnose_folder(incoming_dir):
+    """Utility: report which header row each source file resolved to and
+    how many data rows it yielded, without writing an output file. Handy
+    for spot-checking a batch after changing header detection."""
+    import glob as _glob
+    for p in sorted(_glob.glob(f"{incoming_dir}/*.xlsx") + _glob.glob(f"{incoming_dir}/*.xls") + _glob.glob(f"{incoming_dir}/*.csv")):
+        try:
+            df = read_source_file(p)
+            out, unmapped = map_file_to_canonical(df, p)
+            print(f"{os.path.basename(p):40s} headers={list(df.columns)[:5]}... rows={len(out)} unmapped={len(unmapped)}")
+        except Exception as e:
+            print(f"{os.path.basename(p):40s} FAILED: {e}")
 
 
 def main():
@@ -317,9 +297,6 @@ def main():
             "generated_at": datetime.utcnow().isoformat() + "Z",
         }
 
-        # Per-batch audit trail on disk (separate from the 5-column master
-        # manifest) so failed/unmapped details aren't lost even though the
-        # manifest itself intentionally stays to just those 5 columns.
         try:
             audit_dir = os.path.join(os.path.dirname(abs_output), "batch_logs")
             os.makedirs(audit_dir, exist_ok=True)
@@ -327,7 +304,7 @@ def main():
             with open(audit_path, "w") as f:
                 json.dump(result, f, indent=2)
         except Exception:
-            pass  # audit trail is best-effort, never blocks the batch
+            pass
 
         print(json.dumps(result))
         sys.exit(0)
