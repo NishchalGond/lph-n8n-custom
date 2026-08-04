@@ -1,29 +1,6 @@
 #!/usr/bin/env python3
 """
 master_consolidator.py
-
-Consolidates a folder of messy source spreadsheets (xlsx/xls/xlsm/csv) with
-inconsistent column headers into a single canonical-schema workbook.
-
-This is the pandas-based engine, with the ALIASES table substantially
-widened (see CHANGE NOTE below). Everything else -- token-based matching,
-scored conflict resolution, structured logging, header-row detection -- is
-unchanged from the version this was built from.
-
-CHANGE NOTE (data-loss fix): the previous ALIASES table was too thin for
-this dataset. `read_source_file` hard-fails and drops the ENTIRE file
-(not just unmapped columns) whenever no row in the first HEADER_SCAN_ROWS
-rows matches at least one alias. A source file whose headers happened not
-to hit any of the old aliases was silently thrown away, file and all --
-this is very likely the dominant cause of large chunks of data going
-missing (a 2.36GB source folder producing well under 1GB of consolidated
-output). The aliases below are a superset of the previous list, expanded
-with the real-world header variants this LPH dataset is known to use.
-Add more here as you spot new variants in `unmapped_columns` -- that's the
-intended ongoing maintenance loop for this file, same as before.
-
-Usage:
-    python master_consolidator.py <incoming_dir> <batch_output_path> <run_number> [--verbose]
 """
 from __future__ import annotations
 
@@ -37,14 +14,10 @@ import difflib
 import argparse
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional
 
 import pandas as pd
-
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
 
 CANONICAL_FIELDS = [
     "Name", "Community", "Sub-Community", "Building/Cluster", "Unit Number",
@@ -54,80 +27,63 @@ CANONICAL_FIELDS = [
     "Procedure Value", "Developer", "Project",
 ]
 
-# Widened alias table. Original entries kept; new entries added below each
-# (marked) rather than interleaved, so future diffs against the original
-# script stay readable.
 ALIASES = {
     "Name": [
         "name", "full name", "owner name", "contact name", "client name", "customer name",
-        # added:
         "owner", "client", "name of owner", "client full name", "primary applicant name",
         "first name", "joint acct name", "account name", "nameen",
     ],
     "Community": [
         "community", "community name",
-        # added:
         "master location",
     ],
     "Sub-Community": [
         "sub community", "subcommunity", "sub comm",
-        # added:
         "sub-community",
     ],
     "Building/Cluster": [
         "building", "cluster", "building cluster", "tower", "tower name", "building name",
-        # added:
         "bldg", "bldg no", "building 1", "buildingname 2", "buildingnameen", "building/cluster",
     ],
     "Unit Number": [
         "unit no", "unit number", "unit num", "unit", "apt no", "apartment no", "flat no",
-        # added:
         "villa number", "villa no", "property number", "property no", "no of unit",
         "no of units", "unit id", "unitnumber", "flat number", "flat", "unit name",
     ],
     "Size": [
         "size", "area", "sq ft", "sqft", "area sqft", "size sqft",
-        # added:
         "actual size", "unit size", "actual area",
     ],
     "Plot Reg. No": [
         "plot reg no", "plot registration no", "plot reg number", "plot registration number",
-        # added:
         "reg no", "registration number", "regis",
     ],
     "Plot Number": [
         "plot no", "plot number", "plot num",
-        # added:
         "land number", "land no", "landnumber", "plotno",
     ],
     "DMNO": [
         "dmno", "dm no", "dm number",
-        # added:
         "municipality number", "municipality no",
     ],
     "DMsubno": [
         "dmsubno", "dm subno", "dm sub no", "dm sub number",
-        # added:
         "municipality sub no", "municipality subno",
     ],
     "Bedroom": [
         "bedroom", "bed room", "bedrooms", "beds", "br", "no of bedrooms",
-        # added:
         "bhk", "no bhk", "bed", "rooms", "rooms description",
     ],
     "Type (Buyer/Seller)": [
         "type buyer seller", "buyer seller", "type", "role", "buyer/seller",
-        # added:
         "transaction type", "party type",
     ],
     "Email Address": [
         "email address", "email", "e mail", "email id",
-        # added:
         "e-mail", "email add",
     ],
     "PI number": [
         "pi number", "pi no", "pi num",
-        # added:
         "pino",
     ],
     "Nationality": [
@@ -135,70 +91,49 @@ ALIASES = {
     ],
     "Property Type": [
         "property type", "prop type", "unit type",
-        # added:
         "sub type", "flat typology",
     ],
     "Date": [
         "date", "transaction date", "reg date", "registration date",
-        # added:
         "procedure date", "date of transaction",
     ],
     "Procedure Value": [
         "procedure value", "value", "amount", "price", "transaction value",
-        # added:
         "procedurevalue", "transaction amount",
     ],
     "Developer": [
         "developer", "developer name",
-        # added:
         "project developer",
     ],
     "Project": [
         "project", "project name",
-        # added:
         "master project", "emaar project", "master project land", "project lnd", "sub project",
     ],
-    # NEW canonical-adjacent fields kept as extra aliases feeding existing
-    # columns, so genuinely-new identity fields don't sink a whole file:
-    "Name_ids": [],  # placeholder kept out of CANONICAL_FIELDS on purpose (see note below)
+    "Name_ids": [],
 }
-# Remove the placeholder -- it exists only to document that ID-type fields
-# (Emirates ID, Passport, DOB, Gender, Serial No) were deliberately NOT
-# folded into the 22 canonical columns above, to avoid overwriting a real
-# canonical value with an ID-type value that happens to token-match. If you
-# want those captured too, add new canonical columns for them explicitly
-# rather than aliasing them onto existing fields.
 del ALIASES["Name_ids"]
 
 PHONE_PATTERNS = [
     "mobile", "phone", "contact no", "contact number", "tel", "telephone", "cell",
-    # added:
     "mobile no", "mobile number", "phone no", "primary phone", "phone mobile",
     "primary mobile number", "secondary mobile", "secondary phone", "alternate number",
     "alt number", "alternative number", "second contact", "other number",
     "telephone number", "telephone residence", "telephone office", "general",
 ]
 
-FUZZY_CUTOFF = 0.72  # loosened slightly (was 0.78) -- see CHANGE NOTE above
+FUZZY_CUTOFF = 0.72
 HEADER_SCAN_ROWS = 30
 LOOKAHEAD_ROWS = 4
 MIN_LOOKAHEAD_FILL_RATIO = 0.5
 
-# Match-quality tiers, used to resolve conflicts when two source columns
-# want to claim the same canonical field. Lower number = better match.
-TIER_EXACT = 0      # normalized header == alias, exactly
-TIER_TOKEN = 1       # token-set match (all words of the shorter phrase present)
-TIER_FUZZY = 2       # difflib close-match fallback
+TIER_EXACT = 0
+TIER_TOKEN = 1
+TIER_FUZZY = 2
 
 logger = logging.getLogger("master_consolidator")
 
 
-# --------------------------------------------------------------------------- #
-# Text normalization & alias index
-# --------------------------------------------------------------------------- #
-
 def normalize(s: Optional[str]) -> str:
-    """Lowercase, strip punctuation, collapse whitespace."""
     if s is None:
         return ""
     s = str(s).strip().lower()
@@ -226,18 +161,12 @@ def is_phone_header(norm_header: str) -> bool:
 
 @dataclass
 class HeaderMatch:
-    canonical: Optional[str]   # canonical field name, or "PHONE", or None
-    tier: int = 99             # lower is better
-    distance: float = 1.0      # 0 = perfect, used to break ties within a tier
+    canonical: Optional[str]
+    tier: int = 99
+    distance: float = 1.0
 
 
 def _token_match(norm: str, alias: str) -> bool:
-    """
-    True if `alias`'s words are a subset of `norm`'s words (or vice versa),
-    which is a much safer notion of "contains" than raw substring matching.
-    This is what previously caused false positives like a header
-    normalizing to 'no' matching almost any alias containing 'no'.
-    """
     norm_tokens = set(norm.split())
     alias_tokens = set(alias.split())
     if not norm_tokens or not alias_tokens:
@@ -246,15 +175,6 @@ def _token_match(norm: str, alias: str) -> bool:
 
 
 def map_header(raw_header: str) -> HeaderMatch:
-    """
-    Map a raw source header to a canonical field (or the sentinel "PHONE"
-    for any phone-like column, resolved to Mobile 1/2/3 slots later).
-
-    Matching proceeds in tiers, best first:
-      1. Exact normalized match against a known alias.
-      2. Token-set match (safer than substring matching).
-      3. Fuzzy match via difflib, as a last resort.
-    """
     norm = normalize(raw_header)
     if not norm:
         return HeaderMatch(None)
@@ -268,8 +188,6 @@ def map_header(raw_header: str) -> HeaderMatch:
     best: Optional[HeaderMatch] = None
     for alias, canon in ALIAS_LOOKUP.items():
         if _token_match(norm, alias):
-            # Prefer the alias closest in length to the header (fewer
-            # "extra" words = a tighter, more confident match).
             distance = abs(len(norm) - len(alias)) / max(len(norm), len(alias), 1)
             candidate = HeaderMatch(canon, tier=TIER_TOKEN, distance=distance)
             if best is None or candidate.distance < best.distance:
@@ -285,20 +203,11 @@ def map_header(raw_header: str) -> HeaderMatch:
     return HeaderMatch(None)
 
 
-# --------------------------------------------------------------------------- #
-# Header-row detection
-# --------------------------------------------------------------------------- #
-
 def _row_score(row) -> int:
     return sum(1 for cell in row if map_header(cell).canonical)
 
 
 def _looks_like_data(row, header_score: int) -> bool:
-    """
-    A row below the candidate header should be mostly filled in, and it
-    should NOT itself look like another label/summary row (i.e. it
-    shouldn't match aliases almost as often as the header did).
-    """
     non_empty = sum(1 for v in row if str(v).strip() != "")
     if non_empty == 0:
         return False
@@ -309,21 +218,6 @@ def _looks_like_data(row, header_score: int) -> bool:
 
 
 def find_header_row(raw_df: pd.DataFrame) -> tuple[int, int]:
-    """
-    Scan the first HEADER_SCAN_ROWS rows for the best header candidate.
-
-    A candidate only "qualifies" if the rows immediately beneath it look
-    like real tabular data rather than more summary/label text -- this
-    stops title-block / summary-section rows (e.g. "Unique Developers:")
-    from being mistaken for the real header when they score similarly on
-    alias matches. Qualifying candidates are preferred outright; among
-    qualifying (or, failing that, all) candidates we prefer more good
-    data rows beneath them, then higher score, then the LATER row on ties
-    -- summary blocks tend to sit above the real table, not below it.
-
-    Returns (header_row_index, score). If no candidate scores above zero,
-    returns (0, 0) so the caller can raise a clear error.
-    """
     n = min(HEADER_SCAN_ROWS, len(raw_df))
     candidates = []
     for i in range(n):
@@ -354,21 +248,104 @@ def find_header_row(raw_df: pd.DataFrame) -> tuple[int, int]:
     return best_row, best_score
 
 
-# --------------------------------------------------------------------------- #
-# File reading
-# --------------------------------------------------------------------------- #
+def _dedupe_headers(headers: list[str]) -> list[str]:
+    """
+    Make column labels unique the same way pandas would if it had parsed
+    the header row itself (via header=N). We build `data.columns` by hand
+    below instead of letting pandas do it, so duplicate raw headers (e.g.
+    two columns both literally named "PROPERTY TYPE" in a messy source
+    file) come through as true duplicate labels. That's a landmine: a
+    duplicate label makes `df[that_label]` return a DataFrame instead of
+    a Series, which crashes `.astype(str).str.strip()` later and takes the
+    ENTIRE file down with it (caught by the per-file try/except, so it's
+    silent unless you're reading failed_files in the run's JSON output).
+    Deduping here (PROPERTY TYPE, PROPERTY TYPE.1, ...) keeps both columns
+    independently selectable, exactly like a normal pandas header read.
+    """
+    seen: dict[str, int] = {}
+    result = []
+    for h in headers:
+        label = str(h) if h is not None else ""
+        if label in seen:
+            seen[label] += 1
+            result.append(f"{label}.{seen[label]}")
+        else:
+            seen[label] = 0
+            result.append(label)
+    return result
 
-def read_source_file(path: str) -> pd.DataFrame:
-    """Load a source file and slice it down to header row + data rows."""
+
+def _dedupe_headers(headers: list[str]) -> list[str]:
+    """
+    Make column labels unique the same way pandas would if it had parsed
+    the header row itself (via header=N). We build `data.columns` by hand
+    below instead of letting pandas do it, so duplicate raw headers (e.g.
+    two columns both literally named "PROPERTY TYPE" in a messy source
+    file) come through as true duplicate labels. That's a landmine: a
+    duplicate label makes `df[that_label]` return a DataFrame instead of
+    a Series, which crashes `.astype(str).str.strip()` later and takes the
+    ENTIRE file down with it (caught by the per-file try/except, so it's
+    silent unless you're reading failed_files in the run's JSON output).
+    Deduping here (PROPERTY TYPE, PROPERTY TYPE.1, ...) keeps both columns
+    independently selectable, exactly like a normal pandas header read.
+    """
+    seen: dict[str, int] = {}
+    result = []
+    for h in headers:
+        label = str(h) if h is not None else ""
+        if label in seen:
+            seen[label] += 1
+            result.append(f"{label}.{seen[label]}")
+        else:
+            seen[label] = 0
+            result.append(label)
+    return result
+
+
+class EmptySheetError(ValueError):
+    """Raised for a genuinely empty sheet/file -- not a real failure, just nothing to read."""
+
+
+def list_source_units(path: str) -> list[tuple[str, pd.DataFrame]]:
+    """
+    Return a list of (unit_label, raw_dataframe) pairs to process for this
+    source file.
+
+    CSV files have no concept of sheets, so they're a single unit.
+
+    Excel workbooks (.xlsx/.xls/.xlsm) are expanded to ONE UNIT PER SHEET.
+    Previously this script called pd.read_excel() with no sheet_name arg,
+    which silently defaults to sheet 0 only -- any additional sheets in a
+    workbook were never read at all, no error, no log entry, just gone.
+    For a workbook like an Arabian Ranches file that has both a "Prop"
+    sheet (property registry) and a separate "Arabian Ranches Owner" sheet
+    (owner/contact registry, different schema entirely), that meant the
+    entire second sheet's data was invisible to every run. Each sheet here
+    gets its own independent header-row detection and its own column
+    mapping, since different sheets can use completely different header
+    layouts.
+    """
     ext = os.path.splitext(path)[1].lower()
+    fname = os.path.basename(path)
     if ext == ".csv":
         raw = pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
-    else:
-        engine = "xlrd" if ext == ".xls" else "openpyxl"
-        raw = pd.read_excel(path, header=None, dtype=str, engine=engine, keep_default_na=False)
+        return [(fname, raw)]
 
+    engine = "xlrd" if ext == ".xls" else "openpyxl"
+    xls = pd.ExcelFile(path, engine=engine)
+    units = []
+    multi = len(xls.sheet_names) > 1
+    for sheet_name in xls.sheet_names:
+        raw = pd.read_excel(xls, sheet_name=sheet_name, header=None, dtype=str, keep_default_na=False)
+        label = f"{fname} [{sheet_name}]" if multi else fname
+        units.append((label, raw))
+    return units
+
+
+def parse_raw_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    """Slice a raw (header=None) dataframe down to header row + data rows."""
     if raw.empty:
-        raise ValueError("file is empty")
+        raise EmptySheetError("sheet is empty")
 
     header_row, score = find_header_row(raw)
     if score <= 0:
@@ -376,32 +353,31 @@ def read_source_file(path: str) -> pd.DataFrame:
 
     headers = raw.iloc[header_row].tolist()
     data = raw.iloc[header_row + 1:].reset_index(drop=True)
-    data.columns = [str(h) if h is not None else "" for h in headers]
+    data.columns = _dedupe_headers(headers)
     data = data[~(data.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]
     return data
 
 
-# --------------------------------------------------------------------------- #
-# Canonical mapping
-# --------------------------------------------------------------------------- #
+def read_source_file(path: str) -> pd.DataFrame:
+    """
+    Back-compat single-frame reader (used by diagnose_folder). Reads only
+    the first unit (sheet) of a file -- prefer list_source_units() +
+    parse_raw_frame() directly for anything that needs full multi-sheet
+    coverage, which is now the main pipeline's default behavior.
+    """
+    units = list_source_units(path)
+    _, raw = units[0]
+    return parse_raw_frame(raw)
+
 
 @dataclass
 class MappingResult:
     frame: pd.DataFrame
-    unmapped: list[dict] = field(default_factory=list)  # [{"column": ..., "reason": ...}]
+    unmapped: list[dict] = field(default_factory=list)
 
 
 def map_file_to_canonical(df: pd.DataFrame, filename: str) -> MappingResult:
-    """
-    Map a source dataframe's columns onto CANONICAL_FIELDS.
-
-    Conflict handling: if multiple columns match the same canonical field,
-    the best-scoring match (by tier, then distance) wins; the rest are
-    recorded as unmapped with an explicit "lost to a better match" reason
-    rather than being silently dropped.
-    """
     phone_cols_in_order: list[str] = []
-    # canon -> (column_name, HeaderMatch) for the current best claimant
     best_for: dict[str, tuple[str, HeaderMatch]] = {}
     unmapped: list[dict] = []
 
@@ -424,7 +400,6 @@ def map_file_to_canonical(df: pd.DataFrame, filename: str) -> MappingResult:
         else:
             existing_col, existing_match = best_for[canon]
             if (match.tier, match.distance) < (existing_match.tier, existing_match.distance):
-                # New column is a stronger match; the old one loses.
                 unmapped.append({
                     "column": str(existing_col).strip(),
                     "reason": f"lost to a stronger match for '{canon}' ({col_str})",
@@ -451,7 +426,19 @@ def map_file_to_canonical(df: pd.DataFrame, filename: str) -> MappingResult:
     out = pd.DataFrame()
     for field_name in CANONICAL_FIELDS:
         if field_name in canon_col_for:
-            out[field_name] = df[canon_col_for[field_name]].astype(str).str.strip()
+            col_data = df[canon_col_for[field_name]]
+            if isinstance(col_data, pd.DataFrame):
+                # Defensive fallback: should no longer happen now that
+                # _dedupe_headers() prevents true duplicate labels, but if
+                # it ever does, take the first occurrence and log it
+                # instead of crashing (a crash here previously took the
+                # ENTIRE source file down, not just this one column).
+                logger.warning(
+                    "%s: column '%s' resolved to %d duplicate columns; using the first",
+                    filename, canon_col_for[field_name], col_data.shape[1],
+                )
+                col_data = col_data.iloc[:, 0]
+            out[field_name] = col_data.astype(str).str.strip()
         else:
             out[field_name] = ""
 
@@ -460,35 +447,30 @@ def map_file_to_canonical(df: pd.DataFrame, filename: str) -> MappingResult:
     return MappingResult(frame=out, unmapped=unmapped)
 
 
-# --------------------------------------------------------------------------- #
-# Diagnostics helper (unchanged behavior, now uses logging)
-# --------------------------------------------------------------------------- #
-
 def diagnose_folder(incoming_dir: str) -> None:
-    """
-    Utility: report which header row each source file resolved to and
-    how many data rows it yielded, without writing an output file. Handy
-    for spot-checking a batch after changing header detection.
-    """
     for p in sorted(
         glob.glob(f"{incoming_dir}/*.xlsx")
         + glob.glob(f"{incoming_dir}/*.xls")
         + glob.glob(f"{incoming_dir}/*.csv")
     ):
         try:
-            df = read_source_file(p)
-            result = map_file_to_canonical(df, p)
-            logger.info(
-                "%-40s headers=%s... rows=%d unmapped=%d",
-                os.path.basename(p), list(df.columns)[:5], len(result.frame), len(result.unmapped),
-            )
+            units = list_source_units(p)
         except Exception as e:
-            logger.warning("%-40s FAILED: %s", os.path.basename(p), e)
+            logger.warning("%-40s FAILED to open: %s", os.path.basename(p), e)
+            continue
+        for label, raw in units:
+            try:
+                df = parse_raw_frame(raw)
+                result = map_file_to_canonical(df, label)
+                logger.info(
+                    "%-50s headers=%s... rows=%d unmapped=%d",
+                    label, list(df.columns)[:5], len(result.frame), len(result.unmapped),
+                )
+            except EmptySheetError:
+                logger.info("%-50s empty, skipped", label)
+            except Exception as e:
+                logger.warning("%-50s FAILED: %s", label, e)
 
-
-# --------------------------------------------------------------------------- #
-# Main entry point
-# --------------------------------------------------------------------------- #
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -502,8 +484,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    # Preserve the original positional-args contract for backward compatibility,
-    # while adding an optional --verbose flag.
     if len(sys.argv) < 4:
         print(json.dumps({
             "status": "fatal_error",
@@ -544,17 +524,37 @@ def main() -> None:
         for path in files:
             fname = os.path.basename(path)
             try:
-                raw_df = read_source_file(path)
-                result = map_file_to_canonical(raw_df, fname)
-                if result.unmapped:
-                    unmapped_columns[fname] = result.unmapped
-                frames.append(result.frame)
-                files_succeeded += 1
-                logger.info("%s: OK, %d rows", fname, len(result.frame))
+                units = list_source_units(path)
             except Exception as e:
-                failed_files.append({"file": fname, "error": str(e)})
-                logger.warning("%s: FAILED (%s)", fname, e)
+                # Workbook wouldn't even open (corrupt file, wrong engine, etc.)
+                failed_files.append({"file": fname, "error": f"could not open: {e}"})
+                logger.warning("%s: FAILED to open (%s)", fname, e)
                 continue
+
+            file_had_success = False
+            for label, raw in units:
+                try:
+                    data = parse_raw_frame(raw)
+                except EmptySheetError:
+                    # A genuinely empty extra tab (e.g. a stray "Sheet2"
+                    # with nothing in it) isn't a failure -- just skip it
+                    # quietly instead of cluttering failed_files.
+                    logger.info("%s: empty, skipped", label)
+                    continue
+                except Exception as e:
+                    failed_files.append({"file": label, "error": str(e)})
+                    logger.warning("%s: FAILED (%s)", label, e)
+                    continue
+
+                result = map_file_to_canonical(data, label)
+                if result.unmapped:
+                    unmapped_columns[label] = result.unmapped
+                frames.append(result.frame)
+                file_had_success = True
+                logger.info("%s: OK, %d rows", label, len(result.frame))
+
+            if file_had_success:
+                files_succeeded += 1
 
         combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CANONICAL_FIELDS)
 
@@ -589,7 +589,7 @@ def main() -> None:
             "row_count": int(len(combined)),
             "failed_files": failed_files,
             "unmapped_columns": unmapped_columns,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(UTC).isoformat(),
         }
 
         try:
