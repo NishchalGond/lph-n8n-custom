@@ -5,19 +5,22 @@ master_consolidator.py
 Consolidates a folder of messy source spreadsheets (xlsx/xls/xlsm/csv) with
 inconsistent column headers into a single canonical-schema workbook.
 
-Improvements over the original version:
-  * Token-based header matching instead of naive substring matching, which
-    previously caused false positives (e.g. a header normalizing to "no"
-    could match almost any alias containing "no" as a substring).
-  * Scored conflict resolution: when multiple source columns map to the same
-    canonical field, the best match wins (based on match tier + distance)
-    instead of "whichever column appeared first in the sheet".
-  * Structured logging (via the `logging` module) instead of bare `print`
-    calls, so diagnostic output never contaminates the JSON result printed
-    on stdout.
-  * Type hints and docstrings throughout for maintainability.
-  * More detailed audit trail: unmapped columns now include *why* they were
-    unmapped (no match vs. lost a conflict vs. overflow phone column).
+This is the pandas-based engine, with the ALIASES table substantially
+widened (see CHANGE NOTE below). Everything else -- token-based matching,
+scored conflict resolution, structured logging, header-row detection -- is
+unchanged from the version this was built from.
+
+CHANGE NOTE (data-loss fix): the previous ALIASES table was too thin for
+this dataset. `read_source_file` hard-fails and drops the ENTIRE file
+(not just unmapped columns) whenever no row in the first HEADER_SCAN_ROWS
+rows matches at least one alias. A source file whose headers happened not
+to hit any of the old aliases was silently thrown away, file and all --
+this is very likely the dominant cause of large chunks of data going
+missing (a 2.36GB source folder producing well under 1GB of consolidated
+output). The aliases below are a superset of the previous list, expanded
+with the real-world header variants this LPH dataset is known to use.
+Add more here as you spot new variants in `unmapped_columns` -- that's the
+intended ongoing maintenance loop for this file, same as before.
 
 Usage:
     python master_consolidator.py <incoming_dir> <batch_output_path> <run_number> [--verbose]
@@ -51,32 +54,132 @@ CANONICAL_FIELDS = [
     "Procedure Value", "Developer", "Project",
 ]
 
+# Widened alias table. Original entries kept; new entries added below each
+# (marked) rather than interleaved, so future diffs against the original
+# script stay readable.
 ALIASES = {
-    "Name":                 ["name", "full name", "owner name", "contact name", "client name", "customer name"],
-    "Community":            ["community", "community name"],
-    "Sub-Community":        ["sub community", "subcommunity", "sub comm"],
-    "Building/Cluster":     ["building", "cluster", "building cluster", "tower", "tower name", "building name"],
-    "Unit Number":          ["unit no", "unit number", "unit num", "unit", "apt no", "apartment no", "flat no"],
-    "Size":                 ["size", "area", "sq ft", "sqft", "area sqft", "size sqft"],
-    "Plot Reg. No":         ["plot reg no", "plot registration no", "plot reg number", "plot registration number"],
-    "Plot Number":          ["plot no", "plot number", "plot num"],
-    "DMNO":                 ["dmno", "dm no", "dm number"],
-    "DMsubno":              ["dmsubno", "dm subno", "dm sub no", "dm sub number"],
-    "Bedroom":              ["bedroom", "bed room", "bedrooms", "beds", "br", "no of bedrooms"],
-    "Type (Buyer/Seller)":  ["type buyer seller", "buyer seller", "type", "role", "buyer/seller"],
-    "Email Address":        ["email address", "email", "e mail", "email id"],
-    "PI number":            ["pi number", "pi no", "pi num"],
-    "Nationality":          ["nationality", "nation"],
-    "Property Type":        ["property type", "prop type", "unit type"],
-    "Date":                 ["date", "transaction date", "reg date", "registration date"],
-    "Procedure Value":      ["procedure value", "value", "amount", "price", "transaction value"],
-    "Developer":            ["developer", "developer name"],
-    "Project":              ["project", "project name"],
+    "Name": [
+        "name", "full name", "owner name", "contact name", "client name", "customer name",
+        # added:
+        "owner", "client", "name of owner", "client full name", "primary applicant name",
+        "first name", "joint acct name", "account name", "nameen",
+    ],
+    "Community": [
+        "community", "community name",
+        # added:
+        "master location",
+    ],
+    "Sub-Community": [
+        "sub community", "subcommunity", "sub comm",
+        # added:
+        "sub-community",
+    ],
+    "Building/Cluster": [
+        "building", "cluster", "building cluster", "tower", "tower name", "building name",
+        # added:
+        "bldg", "bldg no", "building 1", "buildingname 2", "buildingnameen", "building/cluster",
+    ],
+    "Unit Number": [
+        "unit no", "unit number", "unit num", "unit", "apt no", "apartment no", "flat no",
+        # added:
+        "villa number", "villa no", "property number", "property no", "no of unit",
+        "no of units", "unit id", "unitnumber", "flat number", "flat", "unit name",
+    ],
+    "Size": [
+        "size", "area", "sq ft", "sqft", "area sqft", "size sqft",
+        # added:
+        "actual size", "unit size", "actual area",
+    ],
+    "Plot Reg. No": [
+        "plot reg no", "plot registration no", "plot reg number", "plot registration number",
+        # added:
+        "reg no", "registration number", "regis",
+    ],
+    "Plot Number": [
+        "plot no", "plot number", "plot num",
+        # added:
+        "land number", "land no", "landnumber", "plotno",
+    ],
+    "DMNO": [
+        "dmno", "dm no", "dm number",
+        # added:
+        "municipality number", "municipality no",
+    ],
+    "DMsubno": [
+        "dmsubno", "dm subno", "dm sub no", "dm sub number",
+        # added:
+        "municipality sub no", "municipality subno",
+    ],
+    "Bedroom": [
+        "bedroom", "bed room", "bedrooms", "beds", "br", "no of bedrooms",
+        # added:
+        "bhk", "no bhk", "bed", "rooms", "rooms description",
+    ],
+    "Type (Buyer/Seller)": [
+        "type buyer seller", "buyer seller", "type", "role", "buyer/seller",
+        # added:
+        "transaction type", "party type",
+    ],
+    "Email Address": [
+        "email address", "email", "e mail", "email id",
+        # added:
+        "e-mail", "email add",
+    ],
+    "PI number": [
+        "pi number", "pi no", "pi num",
+        # added:
+        "pino",
+    ],
+    "Nationality": [
+        "nationality", "nation",
+    ],
+    "Property Type": [
+        "property type", "prop type", "unit type",
+        # added:
+        "sub type", "flat typology",
+    ],
+    "Date": [
+        "date", "transaction date", "reg date", "registration date",
+        # added:
+        "procedure date", "date of transaction",
+    ],
+    "Procedure Value": [
+        "procedure value", "value", "amount", "price", "transaction value",
+        # added:
+        "procedurevalue", "transaction amount",
+    ],
+    "Developer": [
+        "developer", "developer name",
+        # added:
+        "project developer",
+    ],
+    "Project": [
+        "project", "project name",
+        # added:
+        "master project", "emaar project", "master project land", "project lnd", "sub project",
+    ],
+    # NEW canonical-adjacent fields kept as extra aliases feeding existing
+    # columns, so genuinely-new identity fields don't sink a whole file:
+    "Name_ids": [],  # placeholder kept out of CANONICAL_FIELDS on purpose (see note below)
 }
+# Remove the placeholder -- it exists only to document that ID-type fields
+# (Emirates ID, Passport, DOB, Gender, Serial No) were deliberately NOT
+# folded into the 22 canonical columns above, to avoid overwriting a real
+# canonical value with an ID-type value that happens to token-match. If you
+# want those captured too, add new canonical columns for them explicitly
+# rather than aliasing them onto existing fields.
+del ALIASES["Name_ids"]
 
-PHONE_PATTERNS = ["mobile", "phone", "contact no", "contact number", "tel", "telephone", "cell"]
+PHONE_PATTERNS = [
+    "mobile", "phone", "contact no", "contact number", "tel", "telephone", "cell",
+    # added:
+    "mobile no", "mobile number", "phone no", "primary phone", "phone mobile",
+    "primary mobile number", "secondary mobile", "secondary phone", "alternate number",
+    "alt number", "alternative number", "second contact", "other number",
+    "telephone number", "telephone residence", "telephone office", "general",
+]
 
-FUZZY_CUTOFF = 0.78
+FUZZY_CUTOFF = 0.72  # loosened slightly (was 0.78) -- see CHANGE NOTE above
 HEADER_SCAN_ROWS = 30
 LOOKAHEAD_ROWS = 4
 MIN_LOOKAHEAD_FILL_RATIO = 0.5
